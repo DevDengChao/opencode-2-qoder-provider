@@ -1,0 +1,44 @@
+// opencode 2.x（V2）配置示例 —— 与 V1 的 opencode.json.example 不通用：
+// V2 用 providers.<id>.package（带 aisdk: 前缀）+ plugins（注意复数），
+// 且插件入口必须是 dist/plugin-v2.js（V1 的 dist/plugin.js 会被 V2 拒载）。
+//
+// 构建（先本地构建，最稳）：
+//   git clone https://github.com/DevDengChao/opencode-2-qoder-provider.git
+//   cd opencode-2-qoder-provider && npm install && npm run build
+// 然后把下面两处 /abs/path 换成本机实际路径。Linux/macOS 用绝对路径即可；
+// file:// 规格必须写成三斜杠 file:///abs/path/...（Windows 用 file://C:/path/...）。
+{
+  // ── provider：模型后端（dist/index.js，导出 createQoderProvider） ──
+  "providers": {
+    "qoder-cn": {
+      "name": "Qoder CN",
+      "package": "aisdk:file:///abs/path/to/opencode-2-qoder-provider/dist/index.js",
+      "settings": { "region": "cn" },
+      // 锚点模型：其余模型由插件启动时注入（零手写）；这里只写显示名之类的覆盖项
+      "models": { "auto": { "name": "Auto · Qoder CN" } }
+    }
+
+    // 双区域并存（可选）：Global 用同一入口，region 改成 global
+    // ,"qoder": {
+    //   "name": "Qoder",
+    //   "package": "aisdk:file:///abs/path/to/opencode-2-qoder-provider/dist/index.js",
+    //   "settings": { "region": "global" },
+    //   "models": { "auto": { "name": "Qoder Auto" } }
+    // }
+  },
+
+  // ── plugins：宿主钩子（dist/plugin-v2.js，导出 { id, setup }） ──
+  // 字符串形式（自动识别 provider）：
+  "plugins": ["/abs/path/to/opencode-2-qoder-provider/dist/plugin-v2.js"]
+
+  // 对象形式（可显式指定目标 provider 与区域；插件加载早于 provider 注册时用这个）：
+  // "plugins": [
+  //   {
+  //     "package": "/abs/path/to/opencode-2-qoder-provider/dist/plugin-v2.js",
+  //     "options": { "providerID": "qoder-cn", "region": "cn" }
+  //   }
+  // ]
+
+  // 设为默认模型（可选，格式 provider/模型ID）：
+  // ,"model": "qoder-cn/auto"
+}

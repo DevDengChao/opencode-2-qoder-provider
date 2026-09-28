@@ -1,6 +1,10 @@
 {
   "$schema": "https://opencode.ai/config.json",
 
+  // 本文件是 **opencode 1.x（V1）** 的示例。使用 opencode 2.x 请看
+  // opencode-v2.json.example（V2 用 providers.<id>.package + plugins，
+  // 且插件入口是 dist/plugin-v2.js）。
+  //
   // ============================================================
   // 方式一（第一优先级 · 推荐）：本地构建 + file:// 引用
   //
