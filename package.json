@@ -1,6 +1,6 @@
 {
   "name": "opencode-qoder-provider",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Qoder AI provider for OpenCode — based on @qoder-ai/qoder-agent-sdk",
   "author": "wcmk21",
   "type": "module",
@@ -38,6 +38,10 @@
       "import": "./dist/plugin.js",
       "types": "./dist/plugin.d.ts"
     },
+    "./plugin-v2": {
+      "import": "./dist/plugin-v2.js",
+      "types": "./dist/plugin-v2.d.ts"
+    },
     "./server": {
       "import": "./dist/plugin.js",
       "types": "./dist/plugin.d.ts"
@@ -48,7 +52,7 @@
   },
   "scripts": {
     "build": "npm run build:js && npm run build:types",
-    "build:js": "esbuild src/index.ts src/plugin.ts --bundle --platform=node --format=esm --outdir=dist --external:@qoder-ai/qoder-agent-sdk --external:@ai-sdk/provider --external:@opencode-ai/plugin --external:zod",
+    "build:js": "esbuild src/index.ts src/plugin.ts src/plugin-v2.ts --bundle --platform=node --format=esm --outdir=dist --external:@qoder-ai/qoder-agent-sdk --external:@ai-sdk/provider --external:@opencode-ai/plugin --external:zod",
     "build:types": "tsc --emitDeclarationOnly",
     "check": "tsc --noEmit",
     "test": "vitest run",

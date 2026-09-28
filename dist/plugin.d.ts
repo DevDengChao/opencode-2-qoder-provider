@@ -1,5 +1,5 @@
 /**
- * plugin.ts — OpenCode Plugin 入口
+ * plugin.ts — OpenCode V1 Plugin 入口
  *
  * opencode 的模型列表只来自 config（opencode.json 中 provider.models 的显式声明）。
  * provider factory 返回的 models 对象不会被 opencode 读取（opencode 加载 provider
@@ -22,6 +22,9 @@
  *   },
  *   "plugin": ["github:wcmk21/opencode-qoder-provider"]
  * }
+ *
+ * V2（opencode 2.x）请改用 src/plugin-v2.ts（本文件导出的是 V1 契约的裸函数，
+ * V2 加载器会拒绝）。共享逻辑见 catalog-loader.ts。
  */
 import type { Plugin } from "@opencode-ai/plugin";
 /**

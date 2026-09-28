@@ -420,80 +420,60 @@ function isQoderPackage(spec) {
   return typeof spec === "string" && spec.includes("qoder");
 }
 
-// src/plugin.ts
-function toModelSpec(m) {
-  return {
-    name: m.name,
-    reasoning: m.reasoning,
-    tool_call: true,
-    // attachment/modalities 必须跟随模型目录的 input 声明：声明 image 的模型
-    // opencode 才会把用户消息中的图片作为 file part 传给 provider，
-    // 进而由 context.ts 转成 image block 透传给模型；硬编码 text-only 会让
-    // opencode 在宿主层剥掉图片，模型只能看到占位文本
-    attachment: m.input.includes("image"),
-    status: "active",
-    modalities: { input: [...m.input], output: ["text"] },
-    limit: { context: m.contextWindow, output: m.maxTokens },
-    cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 }
-  };
-}
-var QoderPlugin = async (ctx) => {
-  const clientLog = (level, message, extra) => ctx.client.app.log({
-    body: { service: "qoder-provider", level, message, extra }
-  }).catch(() => {
-  });
-  return {
-    // ── Config hook：动态模型目录注入 ──
-    // opencode 在读取 cfg.provider 之前运行所有插件的 config hook，
-    // 此处写入的 provider.models 会在随后被解析进模型数据库（模型选择器数据源）。
-    config: async (config) => {
-      const providers = config.provider;
-      if (!providers) return;
-      for (const [providerID, p] of Object.entries(providers)) {
-        if (!p || !isQoderPackage(p.npm)) continue;
-        const region = resolveRegion(p.options?.region);
-        const models = await loadCatalog(p.options, region);
-        if (!models.length) {
-          logInfo(`[qoder-plugin] no models resolved for provider "${providerID}" (region=${region})`);
+// src/plugin-v2.ts
+var QoderPluginV2 = {
+  id: "qoder.provider",
+  setup: async (ctx) => {
+    const options = ctx.options ?? {};
+    await ctx.catalog.transform(async (catalog) => {
+      const targets = [];
+      if (typeof options.providerID === "string" && options.providerID.length > 0) {
+        targets.push({ id: options.providerID, settings: {} });
+      } else {
+        for (const record of catalog.provider.list()) {
+          const api = record.provider.api;
+          if (!isQoderPackage(api?.package)) continue;
+          targets.push({
+            id: record.provider.id,
+            settings: api?.settings ?? {}
+          });
+        }
+      }
+      if (targets.length === 0) {
+        logInfo("[qoder-v2] no qoder provider found in catalog; declare one under `providers` (see README)");
+        return;
+      }
+      for (const target of targets) {
+        const settings = target.settings;
+        const region = resolveRegion(
+          options.region ?? (typeof settings.region === "string" ? settings.region : void 0)
+        );
+        const loaderOptions = { ...settings };
+        if (options.apiKey !== void 0) loaderOptions.apiKey = options.apiKey;
+        const catalogModels = await loadCatalog(loaderOptions, region);
+        if (catalogModels.length === 0) {
+          logInfo(`[qoder-v2] no models resolved for provider "${target.id}" (region=${region})`);
           continue;
         }
-        const declared = p.models ?? {};
-        const injected = {};
-        for (const m of models) injected[m.id] = toModelSpec(m);
-        for (const [id, spec] of Object.entries(declared)) {
-          injected[id] = { ...injected[id], ...spec };
+        for (const model of catalogModels) {
+          catalog.model.update(target.id, model.id, (entry) => {
+            entry.name = model.name;
+            entry.capabilities = {
+              tools: true,
+              input: [...model.input],
+              output: ["text"]
+            };
+            entry.limit = { context: model.contextWindow, output: model.maxTokens };
+            entry.enabled = true;
+          });
         }
-        p.models = injected;
-        logInfo(`[qoder-plugin] injected ${Object.keys(injected).length} models into provider "${providerID}" (region=${region})`);
+        logInfo(`[qoder-v2] injected ${catalogModels.length} models into provider "${target.id}" (region=${region})`);
       }
-    },
-    // ── 通用事件处理 ──
-    event: async ({ event }) => {
-      if (event.type === "session.created") {
-        await clientLog("info", "Qoder provider active", {
-          directory: ctx.directory
-        });
-      }
-      if (event.type === "session.idle") {
-        const region = resolveRegion();
-        const pat = resolvePat(void 0, region);
-        if (pat) {
-          try {
-            await fetchModelCatalog(pat, region);
-            await clientLog("debug", "Model cache refreshed");
-          } catch {
-            await clientLog("debug", "Model cache refresh skipped");
-          }
-        }
-      }
-      if (event.type === "session.error") {
-        await clientLog("warn", "Session error detected");
-      }
-    }
-  };
+    });
+  }
 };
-var plugin_default = QoderPlugin;
+var plugin_v2_default = QoderPluginV2;
 export {
-  QoderPlugin,
-  plugin_default as default
+  QoderPluginV2,
+  plugin_v2_default as default
 };
