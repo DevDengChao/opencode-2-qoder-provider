@@ -1,62 +1,50 @@
-interface V2ProviderInfo {
-    id: string;
-    name?: string;
-    api?: {
-        type?: string;
-        package?: string;
-        settings?: Record<string, unknown>;
-    };
-}
-interface V2CatalogProviderRecord {
-    readonly provider: V2ProviderInfo;
-    readonly models: ReadonlyMap<string, unknown>;
-}
-interface V2ModelApi {
-    type?: string;
-    package?: string;
-    url?: string;
-    settings?: Record<string, unknown>;
-    id?: string;
-}
 interface V2ModelInfo {
-    id: string;
-    providerID: string;
-    name: string;
-    api: V2ModelApi;
-    capabilities: {
+    id?: string;
+    modelID?: string;
+    providerID?: string;
+    name?: string;
+    capabilities?: {
         tools: boolean;
         input: string[];
         output: string[];
     };
-    limit: {
+    limit?: {
         context: number;
         input?: number;
         output: number;
     };
-    enabled: boolean;
+    enabled?: boolean;
+    status?: string;
 }
+/** 2.0.18 的 model draft */
+interface V2ModelDraft {
+    update(providerID: string, modelID: string, update: (model: V2ModelInfo) => void): void;
+    provider?: {
+        list?(): readonly unknown[];
+    };
+}
+/** 早期 V2 beta 的 catalog draft */
 interface V2CatalogDraft {
     readonly provider: {
-        list(): readonly V2CatalogProviderRecord[];
-        get(providerID: string): V2CatalogProviderRecord | undefined;
-        update(providerID: string, update: (provider: V2ProviderInfo) => void): void;
-        remove(providerID: string): void;
+        list(): readonly unknown[];
     };
     readonly model: {
-        get(providerID: string, modelID: string): V2ModelInfo | undefined;
         update(providerID: string, modelID: string, update: (model: V2ModelInfo) => void): void;
-        remove(providerID: string, modelID: string): void;
     };
 }
 export interface V2PluginContext {
     readonly options?: Record<string, unknown>;
-    readonly catalog: {
+    /** 2.0.18+ */
+    readonly model?: {
+        transform(callback: (draft: V2ModelDraft) => Promise<void> | void): Promise<unknown>;
+    };
+    /** 早期 beta / 兼容 */
+    readonly catalog?: {
         transform(callback: (draft: V2CatalogDraft) => Promise<void> | void): Promise<unknown>;
-        reload(): Promise<void>;
     };
 }
 export interface QoderV2PluginOptions {
-    /** 显式指定 provider ID；不填则按 api.package 自动识别 */
+    /** 显式指定 provider ID；不填则按包规格自动识别 */
     providerID?: string;
     /** 覆盖区域（global|cn），默认取 provider settings.region / QODER_REGION */
     region?: string;

@@ -421,22 +421,58 @@ function isQoderPackage(spec) {
 }
 
 // src/plugin-v2.ts
+var REGIONS = ["cn", "global"];
+function providerInfoOf(item) {
+  if (!item || typeof item !== "object") return void 0;
+  const rec = item;
+  const inner = rec.provider && typeof rec.provider === "object" ? rec.provider : rec;
+  return typeof inner?.id === "string" ? inner : void 0;
+}
+function listProviders(draft) {
+  const seam = draft;
+  const raw = seam?.provider?.list?.() ?? [];
+  return raw.map(providerInfoOf).filter((p) => !!p);
+}
+var packageOf = (p) => p.api?.package ?? p.package;
+var settingsOf = (p) => p.api?.settings ?? p.settings ?? {};
+function modelUpdaterOf(draft) {
+  const d = draft;
+  if (typeof d.update === "function") return (p, m, fn) => d.update(p, m, fn);
+  if (typeof d.model?.update === "function") return (p, m, fn) => d.model.update(p, m, fn);
+  return void 0;
+}
 var QoderPluginV2 = {
   id: "qoder.provider",
   setup: async (ctx) => {
     const options = ctx.options ?? {};
-    await ctx.catalog.transform(async (catalog) => {
+    const seam = ctx.model ?? ctx.catalog;
+    if (!seam || typeof seam.transform !== "function") {
+      logInfo("[qoder-v2] no model-catalog namespace on ctx (local context); nothing to do");
+      return;
+    }
+    const loaderOptions = {};
+    if (options.apiKey !== void 0) loaderOptions.apiKey = options.apiKey;
+    const catalogs = /* @__PURE__ */ new Map();
+    for (const region of REGIONS) catalogs.set(region, await loadCatalog(loaderOptions, region));
+    const prefetchedRegion = resolveRegion(options.region);
+    if ((catalogs.get(prefetchedRegion) ?? []).length === 0) {
+      logInfo(`[qoder-v2] model catalog is empty for region=${prefetchedRegion}`);
+    }
+    await seam.transform((draft) => {
+      const upsertModel = modelUpdaterOf(draft);
+      if (!upsertModel) {
+        logError("[qoder-v2] unsupported V2 draft shape (no model update op); skipping injection");
+        return;
+      }
+      const providers = listProviders(draft);
       const targets = [];
       if (typeof options.providerID === "string" && options.providerID.length > 0) {
-        targets.push({ id: options.providerID, settings: {} });
+        const found = providers.find((p) => p.id === options.providerID);
+        targets.push({ id: options.providerID, settings: found ? settingsOf(found) : {} });
       } else {
-        for (const record of catalog.provider.list()) {
-          const api = record.provider.api;
-          if (!isQoderPackage(api?.package)) continue;
-          targets.push({
-            id: record.provider.id,
-            settings: api?.settings ?? {}
-          });
+        for (const p of providers) {
+          if (!isQoderPackage(packageOf(p))) continue;
+          targets.push({ id: p.id, settings: settingsOf(p) });
         }
       }
       if (targets.length === 0) {
@@ -444,32 +480,34 @@ var QoderPluginV2 = {
         return;
       }
       for (const target of targets) {
-        const settings = target.settings;
         const region = resolveRegion(
-          options.region ?? (typeof settings.region === "string" ? settings.region : void 0)
+          options.region ?? (typeof target.settings.region === "string" ? target.settings.region : void 0)
         );
-        const loaderOptions = { ...settings };
-        if (options.apiKey !== void 0) loaderOptions.apiKey = options.apiKey;
-        const catalogModels = await loadCatalog(loaderOptions, region);
+        const catalogModels = catalogs.get(region) ?? catalogs.get(prefetchedRegion) ?? [];
         if (catalogModels.length === 0) {
-          logInfo(`[qoder-v2] no models resolved for provider "${target.id}" (region=${region})`);
+          logInfo(`[qoder-v2] no models available for provider "${target.id}" (region=${region})`);
           continue;
         }
-        const providerApi = catalog.provider.get(target.id)?.provider.api;
+        let applied = 0;
         for (const model of catalogModels) {
-          catalog.model.update(target.id, model.id, (entry) => {
-            if (providerApi) entry.api = { ...providerApi, id: model.id };
-            entry.name = model.name;
-            entry.capabilities = {
-              tools: true,
-              input: [...model.input],
-              output: ["text"]
-            };
-            entry.limit = { context: model.contextWindow, output: model.maxTokens };
-            entry.enabled = true;
-          });
+          try {
+            upsertModel(target.id, model.id, (entry) => {
+              if (Object.isFrozen(entry)) return;
+              entry.name = model.name;
+              entry.capabilities = { tools: true, input: [...model.input], output: ["text"] };
+              entry.limit = { context: model.contextWindow, output: model.maxTokens };
+              entry.enabled = true;
+              entry.status = "active";
+            });
+            applied += 1;
+          } catch (err) {
+            logError(
+              `[qoder-v2] failed to inject model "${model.id}" into "${target.id}":`,
+              err?.message || err
+            );
+          }
         }
-        logInfo(`[qoder-v2] injected ${catalogModels.length} models into provider "${target.id}" (region=${region})`);
+        logInfo(`[qoder-v2] injected ${applied}/${catalogModels.length} models into provider "${target.id}" (region=${region})`);
       }
     });
   }
