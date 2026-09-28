@@ -299,20 +299,42 @@ export QODER_CN_CLI_PATH=/path/to/qoderclicn.js                        # 或显�
 
 ### 5. 使用
 
+**交互式（TUI）**
+
 ```bash
 opencode
 ```
 
 启动后 `/models` 中应出现 `Qoder`（及 `Qoder CN`）分组——分组内即动态目录
-注入的全部模型，选中即用。
+注入的全部模型，选中即用；`/models qoder` 可快速过滤，会话中随时切换。
+
+**一次性命令（脚本 / CI）**
+
+```bash
+opencode run -m qoder-cn/auto "只回复：OK"                      # 普通输出
+opencode run --format json -m qoder-cn/auto "…"                 # JSON 事件流（便于解析）
+opencode run -m qoder-cn/auto --session ses_xxx "第二轮追问"     # 续同一会话
+opencode run --auto -m qoder-cn/auto "用 bash 执行 echo hi"      # 允许工具执行
+```
+
+模型一律按 `provider/model` 引用（`qoder-cn/auto`、`qoder/ultimate` …）。
+
+**固定默认模型**
+
+```jsonc
+// ~/.config/opencode/opencode.jsonc 顶层
+"model": "qoder-cn/auto"
+```
 
 - **切换模型**：TUI 中 `/models` 选择，或 `/models qoder` 快速过滤
-- **默认模型**：通过顶层 `"model"` 配置固定（见上文）
 - **图片输入**：仅声明支持 `image` 的模型可贴图（动态目录中服务端标记
-  `is_vl` 的模型，以及静态兜底中的 Global `auto`）；其余模型中图片会被
-  降级为占位文本，不会报错
-- **验证生效**：日志中出现 `injected N models into provider ...` 即说明
-  模型目录注入成功（见下文"日志"与"故障排查"）
+  `is_vl` 的模型，如 `auto`）；其余模型中图片会被降级为占位文本，不会报错
+- **验证生效**：日志中出现 `injected N models into provider ...`（V2 前缀
+  `[qoder-v2]`，V1 为 `[qoder-plugin]`）即说明模型目录注入成功
+  （见下文"日志"与"故障排查"）
+- **改动后要重启服务**：`systemctl restart opencode` —— opencode 在启动时加载
+  插件与 provider 包，配置热重载不会重新加载它们；重启后
+  `opencode models | grep -c '^qoder-cn/'` 应等于目录条数（本机实测 14）
 
 ## OpenCode V2（2.x）接入
 
@@ -393,10 +415,28 @@ provider 本体 `dist/index.js` 两个大版本通用，无需改动。
   - 改动插件或 provider 配置后需要重启 opencode 服务（配置热重载不会重新加载
     provider 包）。
 
+## 兼容性与验证记录
+
+| 组件 | 版本（已验证） |
+|------|----------------|
+| opencode | `@opencode/cli` **2.0.18**（V2；V1 `opencode-ai` 1.18.x 仍走 `dist/plugin.js`） |
+| Qoder CLI（Global） | `@qoder-ai/qodercli` 1.1.31（ProcessTransport 直接运行 `bundle/qodercli.js`） |
+| Qoder CLI（CN） | `@qodercn-ai/qoderclicn` 1.1.64（`bundle/qoderclicn.js`） |
+| Agent SDK | `@qoder-ai/qoder-agent-sdk` 1.0.27 |
+
+验证项（2026-09-28；CN 账号，systemd 部署的 `opencode serve` 2.0.18）：
+
+- 目录注入：`opencode models | grep -c '^qoder-cn/'` → **14**
+- 基本对话：`opencode run -m qoder-cn/auto "只回复：OK"` → `OK`
+- 工具调用：bash 工具经声明型 MCP 桥接执行，回显命令输出
+- 多轮：`opencode run --session <id> "…"` 第二轮正确读到上一轮上下文
+- 回归：非 Qoder provider（`opencode/*`）调用不受影响
+- 测试：`npm test` 108 例全绿；`tsc --noEmit` 干净
+
 ## 可用模型
 
-模型列表以**动态目录**为准（HTTP API 获取，每小时刷新，由插件 config hook 在启动时
-自动注入，无需手动声明）；服务端上线新模型后自动出现。下表仅为网络不可用时的
+模型列表以**动态目录**为准（HTTP API 获取，每小时刷新，由插件在启动时注入——V1 走
+config hook，V2 走 `ctx.model.transform`——无需手动声明）；服务端上线新模型后自动出现。下表仅为网络不可用时的
 静态兜底，只保留 Qoder 官方路由模型；第三方模型（Qwen / Kimi / GLM / DeepSeek /
 MiniMax / Cantus 等）迭代频繁，不进入静态表，由动态目录提供。
 
@@ -416,6 +456,15 @@ MiniMax / Cantus 等）迭代频繁，不进入静态表，由动态目录提供
 |---------|------|:----:|-------:|
 | `auto` | Auto · Qoder CN | ✅ | 180K |
 
+### CN 实测目录（2026-09-28，CN 账号 + CN CLI 1.1.64）
+
+`auto` · `qwen3.7-max` · `qwen3.7-plus` · `deepseek-v4-pro` · `deepseek-v4-flash`
+· `glm-5.2` · `kimi-k2.6` · `minimax-m2.7` · `gmodel` · `gfmodel` ·
+`kmodel_latest` · `qmodel_38max` · `q37fmodel` · `qfmodel`（共 **14** 个）
+
+仅作对照：实际以 `/models` / `opencode models` 为准，目录随账号套餐与服务端
+上线节奏变化；API 标记 `is_vl` 的模型会自动声明 `image` 输入。
+
 获取失败时自动使用上表静态列表；也可在 opencode.json 中手动声明以覆盖个别字段
 （如自定义显示名）。
 
@@ -430,7 +479,7 @@ MiniMax / Cantus 等）迭代频繁，不进入静态表，由动态目录提供
 
 | 现象 | 排查步骤 |
 |------|----------|
-| `/models` 中没有 Qoder 分组 | 1）确认 opencode.json 同时配置了 `provider` 与 `plugin` 字段（两者缺一不可）；2）查看日志中是否有 `[qoder-plugin] injected N models`；3）PAT 未设置时仅会出现静态兜底模型（5 个官方路由模型），而不是完整目录 |
+| `/models` 中没有 Qoder 分组 | 1）确认 opencode.json 同时配置了 `provider` 与 `plugin` 字段（两者缺一不可）；2）查看日志中是否有 `injected N models into provider …`（V1 前缀 `[qoder-plugin]`，V2 前缀 `[qoder-v2]`）；3）PAT 未设置时仅会出现静态兜底模型（CN 为 1 个、Global 为 5 个），而不是完整目录 |
 | Git 直装后 `/models` 无 Qoder 且日志无 `injected`（配置确认无误） | opencode 自动安装 git 依赖可能在"包本体落盘"环节静默挂起（网络不佳时，依赖树已落盘但本体缺失，全程无报错——安装错误仅发往会话事件流，不写日志）。按[方式二](#方式二git-直装--手动预热)的预热命令把包手动装进包缓存后重启：Windows `npm install "github:wcmk21/opencode-qoder-provider" --prefix "$env:USERPROFILE\.cache\opencode\packages\github_wcmk21\opencode-qoder-provider"`，Linux/macOS 目录名保留冒号（见[包缓存位置](#包缓存位置)）；或改用[方式一](#方式一本地构建--file-引用推荐)的本地路径 |
 | 模型列表比预期少 | 模型目录来自 HTTP API（1 小时缓存）。看日志是否有 403 / 网络错误；删除模型缓存 `~/.opencode/qoder-models.json`（CN 为 `qoder-cn-models.json`）后重启强制刷新 |
 | 调用报 `Set QODER_PERSONAL_ACCESS_TOKEN` | PAT 未传到模型调用层：确认环境变量名拼写（CN 区需 `QODERCN_PERSONAL_ACCESS_TOKEN`），或改用 `options.apiKey`；Windows 下 `$env:` 设置仅在当前会话生效 |
@@ -460,9 +509,8 @@ src/
 ## 已知限制
 
 1. **图片输入部分支持**：最新 user 消息中的图片会以 Anthropic 风格 image block
-   经 qodercli wire 协议透传给模型（实测 qodercli 1.1.31，global auto 与动态
-   目录中服务端标记 `is_vl` 的模型声明 `image` 输入；CN 区域未实测暂保持
-   text-only）。其余场景仍降级为 `[file: mediaType]` 占位符：历史消息中的
+   经 qodercli wire 协议透传给模型（global 实测 qodercli 1.1.31；CN 侧由动态目录
+   按服务端 `is_vl` 声明 `image`，透传链路未单独实测）。其余场景仍降级为 `[file: mediaType]` 占位符：历史消息中的
    图片（回放 JSON 保持纯文本）、工具结果中的图片（如 Read 读图）、以及
    非图片文件
 2. **token 统计为估算值，$ spent 实为 Credits**：qodercli 不上报真实 token
@@ -476,17 +524,24 @@ src/
 3. **每请求冷启动**：无状态设计意味着每次请求都 spawn 一个新的 qodercli 进程，
    首包延迟高于常驻连接
 4. **Bun 运行时**：opencode 是 Bun 编译二进制，SDK 默认 WorkerTransport 不兼容，
-   本包强制使用 ProcessTransport 运行 `@qoder-ai/qodercli` 自带的 JS 版 CLI
+   本包强制使用 ProcessTransport 运行 CLI 自带的 JS 版 bundle；且**按区域**选择
+   二进制（Global：`@qoder-ai/qodercli`，CN：`@qodercn-ai/qoderclicn`），因为区域是
+   CLI 的构建期常量，跨区域调用会被拒绝（见「CN 区域特别说明」）
 
 ## 开发
 
 ```bash
 npm install        # 安装依赖
 npm run check      # TypeScript 类型检查
-npm run build      # 构建 dist/（esbuild bundle + tsc 声明文件）
-npm test           # 运行单元测试（vitest，无需网络/PAT）
+npm run build      # 构建 dist/（provider：esbuild bundle + tsc 声明）与 plugin-v2/index.js（V2 插件目录包）
+npm test           # 运行单元测试（vitest，无需网络/PAT；当前 108 例）
 node test-bridge.mjs  # 端到端测试（需要真实 PAT 与网络）
 ```
+
+跑测试时建议显式清掉区域/PAT 环境变量
+（`env -u QODER_REGION -u QODERCN_PERSONAL_ACCESS_TOKEN npm test`）——shell 里
+导出的变量会掩盖区域相关缺陷；测试自身通过 `QODER_LOG_FILE` 写临时日志，
+不会污染真实日志。
 
 ## License
 
