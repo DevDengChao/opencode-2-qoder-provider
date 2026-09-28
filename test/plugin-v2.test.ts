@@ -104,6 +104,13 @@ describe("V2 插件：catalog.transform 注入模型", () => {
     expect(updates[0].model.limit).toEqual({ context: 180_000, output: 32_768 });
     expect(updates[0].model.enabled).toBe(true);
     expect(updates[0].model.name).toBe("Auto · Qoder CN");
+    // 必须继承 provider 的 api（type/package/settings），否则新建条目会是 native
+    expect(updates[0].model.api).toEqual({
+      type: "aisdk",
+      package: "file:///root/workspace/my/opencode-2-qoder-provider/dist/index.js",
+      settings: { region: "cn" },
+      id: "auto",
+    });
   });
 
   it("options.providerID 显式指定时，即使 catalog 里还看不到该 provider 也能注入（顺序无关）", async () => {

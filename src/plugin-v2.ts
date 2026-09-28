@@ -39,10 +39,18 @@ interface V2CatalogProviderRecord {
   readonly provider: V2ProviderInfo;
   readonly models: ReadonlyMap<string, unknown>;
 }
+interface V2ModelApi {
+  type?: string;
+  package?: string;
+  url?: string;
+  settings?: Record<string, unknown>;
+  id?: string;
+}
 interface V2ModelInfo {
   id: string;
   providerID: string;
   name: string;
+  api: V2ModelApi;
   capabilities: { tools: boolean; input: string[]; output: string[] };
   limit: { context: number; input?: number; output: number };
   enabled: boolean;
@@ -119,8 +127,14 @@ export const QoderPluginV2 = {
           continue;
         }
 
+        // 新建的 catalog 模型条目默认 api.type = "native"（ModelV2.Info.empty），
+        // 必须把 provider 的 api（type/package/settings）复制过来、只覆盖模型 id，
+        // 否则该模型不会经由本包的 provider 包路由。
+        const providerApi = catalog.provider.get(target.id)?.provider.api;
+
         for (const model of catalogModels) {
           catalog.model.update(target.id, model.id, (entry) => {
+            if (providerApi) entry.api = { ...providerApi, id: model.id };
             entry.name = model.name;
             entry.capabilities = {
               tools: true,

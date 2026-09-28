@@ -455,8 +455,10 @@ var QoderPluginV2 = {
           logInfo(`[qoder-v2] no models resolved for provider "${target.id}" (region=${region})`);
           continue;
         }
+        const providerApi = catalog.provider.get(target.id)?.provider.api;
         for (const model of catalogModels) {
           catalog.model.update(target.id, model.id, (entry) => {
+            if (providerApi) entry.api = { ...providerApi, id: model.id };
             entry.name = model.name;
             entry.capabilities = {
               tools: true,

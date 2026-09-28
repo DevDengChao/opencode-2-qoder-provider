@@ -11,10 +11,18 @@ interface V2CatalogProviderRecord {
     readonly provider: V2ProviderInfo;
     readonly models: ReadonlyMap<string, unknown>;
 }
+interface V2ModelApi {
+    type?: string;
+    package?: string;
+    url?: string;
+    settings?: Record<string, unknown>;
+    id?: string;
+}
 interface V2ModelInfo {
     id: string;
     providerID: string;
     name: string;
+    api: V2ModelApi;
     capabilities: {
         tools: boolean;
         input: string[];
