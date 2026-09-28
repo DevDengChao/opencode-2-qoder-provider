@@ -152,6 +152,39 @@ describe("StreamMapper 事件映射", () => {
     expect((parts[0] as { error: Error }).error.message).toBe("boom");
   });
 
+  it("result error_during_execution + is_error → error part（不能静默 finish）", () => {
+    // 实测：CN 账号配了全局 CLI 时，qodercli 返回
+    //   {type:"result", subtype:"error_during_execution", is_error:true,
+    //    errors:["The provided access token was rejected by the API"],
+    //    terminal_reason:"access_token_invalid"}
+    // 旧实现只认 subtype==="error"，于是把失败当成成功 → opencode 收到空回复。
+    const m = new StreamMapper();
+    const parts = m.map({
+      type: "result",
+      subtype: "error_during_execution",
+      is_error: true,
+      errors: ["The provided access token was rejected by the API"],
+      terminal_reason: "access_token_invalid",
+    });
+    expect(parts).toHaveLength(1);
+    expect(parts[0].type).toBe("error");
+    expect((parts[0] as { error: Error }).error.message).toContain("access token was rejected");
+  });
+
+  it("result is_error（无 errors 数组）→ 带上 terminal_reason 的 error part", () => {
+    const m = new StreamMapper();
+    const parts = m.map({ type: "result", subtype: "error_max_turns", is_error: true, terminal_reason: "max_turns" });
+    expect(parts).toHaveLength(1);
+    expect(parts[0].type).toBe("error");
+    expect((parts[0] as { error: Error }).error.message).toContain("max_turns");
+  });
+
+  it("result success 且 is_error=false → 仍走 finish", () => {
+    const m = new StreamMapper();
+    const parts = m.map({ type: "result", subtype: "success", is_error: false });
+    expect(parts[0].type).toBe("finish");
+  });
+
   it("result success 发出 finish（权威 usage）", () => {
     const m = new StreamMapper();
     const parts = m.map({ type: "result", subtype: "success", usage: { input_tokens: 3, output_tokens: 7 } });

@@ -67,6 +67,9 @@
   "peerDependencies": {
     "@ai-sdk/provider": "^3.0.8"
   },
+  "optionalDependencies": {
+    "@qodercn-ai/qoderclicn": "^1.1.64"
+  },
   "devDependencies": {
     "@ai-sdk/provider": "^3.0.8",
     "@opencode-ai/plugin": "^1.18.23",

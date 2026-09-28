@@ -251,12 +251,13 @@ var StreamMapper = class {
   //   stream_event 与 assistant 完整消息内容重复，统一只走 stream_event 路径）
   // ─── result 消息处理 ─────────────────────────────────────────────────────
   mapResult(msg) {
-    if (msg.subtype === "error") {
-      const errors = msg.errors || [];
-      return [{
-        type: "error",
-        error: new Error(errors.map((e) => e.message).join("; ") || "Unknown error")
-      }];
+    const subtype = msg.subtype;
+    const isError = msg.is_error === true || subtype === "error" || typeof subtype === "string" && subtype.startsWith("error");
+    if (isError) {
+      const raw = Array.isArray(msg.errors) ? msg.errors : [];
+      const messages = raw.map((e) => typeof e === "string" ? e : e?.message).filter((s) => typeof s === "string" && s.length > 0);
+      const detail = messages.join("; ") || (typeof msg.terminal_reason === "string" ? msg.terminal_reason : "") || (typeof subtype === "string" ? subtype : "") || "Unknown error";
+      return [{ type: "error", error: new Error(detail) }];
     }
     this.applyUsage(msg.usage, true);
     this.applyModelUsage(msg.modelUsage);
@@ -690,11 +691,11 @@ async function fetchModelCatalog(pat, region) {
     });
   }
   if (models.length > 0) {
-    const cache = { updatedAt: Date.now(), models };
+    const cache2 = { updatedAt: Date.now(), models };
     try {
       const p = getCachePath(region);
       mkdirSync2(dirname(p), { recursive: true });
-      writeFileSync(p, JSON.stringify(cache), "utf-8");
+      writeFileSync(p, JSON.stringify(cache2), "utf-8");
     } catch {
     }
   }
@@ -711,46 +712,68 @@ import { existsSync as existsSync3 } from "node:fs";
 import { join as join3, dirname as dirname2 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
-var cachedPath = null;
-function resolveQoderCliPath() {
-  if (cachedPath) return cachedPath;
-  const envPath = process.env.QODER_CLI_PATH;
-  if (envPath && existsSync3(envPath)) {
-    cachedPath = envPath;
-    logInfo(`resolveQoderCliPath: using QODER_CLI_PATH=${cachedPath}`);
-    return cachedPath;
+var FLAVORS = {
+  global: {
+    npmPackage: "@qoder-ai/qodercli",
+    bundlePath: "bundle/qodercli.js",
+    command: "qodercli",
+    envVar: "QODER_GLOBAL_CLI_PATH"
+  },
+  cn: {
+    npmPackage: "@qodercn-ai/qoderclicn",
+    bundlePath: "bundle/qoderclicn.js",
+    command: "qoderclicn",
+    envVar: "QODER_CN_CLI_PATH"
+  }
+};
+var cache = /* @__PURE__ */ new Map();
+function resolveQoderCliPath(region = "global") {
+  const key = region === "cn" ? "cn" : "global";
+  const cached = cache.get(key);
+  if (cached) return cached;
+  const flavor = FLAVORS[key];
+  for (const envKey of [flavor.envVar, "QODER_CLI_PATH"]) {
+    const envPath = process.env[envKey];
+    if (envPath && existsSync3(envPath)) {
+      logInfo(`resolveQoderCliPath(${key}): using ${envKey}=${envPath}`);
+      cache.set(key, envPath);
+      return envPath;
+    }
   }
   try {
     const currentDir = dirname2(fileURLToPath(import.meta.url));
+    const [scope, name] = flavor.npmPackage.split("/");
     const candidates = [
       // bundle 后位于 dist/，node_modules 在上级（插件包根）
-      join3(currentDir, "..", "node_modules", "@qoder-ai", "qodercli", "bundle", "qodercli.js"),
+      join3(currentDir, "..", "node_modules", scope, name, flavor.bundlePath),
       // 向上两级（嵌套安装）
-      join3(currentDir, "..", "..", "node_modules", "@qoder-ai", "qodercli", "bundle", "qodercli.js")
+      join3(currentDir, "..", "..", "node_modules", scope, name, flavor.bundlePath)
     ];
-    for (const c of candidates) {
-      if (existsSync3(c)) {
-        cachedPath = c;
-        logInfo(`resolveQoderCliPath: found at ${cachedPath}`);
-        return cachedPath;
+    for (const candidate of candidates) {
+      if (existsSync3(candidate)) {
+        logInfo(`resolveQoderCliPath(${key}): found at ${candidate}`);
+        cache.set(key, candidate);
+        return candidate;
       }
     }
   } catch {
   }
   try {
     const require2 = createRequire(import.meta.url);
-    const resolved = require2.resolve("@qoder-ai/qodercli/bundle/qodercli.js");
+    const resolved = require2.resolve(`${flavor.npmPackage}/${flavor.bundlePath}`);
     if (existsSync3(resolved)) {
-      cachedPath = resolved;
-      logInfo(`resolveQoderCliPath: require.resolve found ${cachedPath}`);
-      return cachedPath;
+      logInfo(`resolveQoderCliPath(${key}): require.resolve found ${resolved}`);
+      cache.set(key, resolved);
+      return resolved;
     }
   } catch {
   }
-  const fallback = "qodercli";
-  logError(`resolveQoderCliPath: could not resolve qodercli.js, falling back to "${fallback}"`);
-  cachedPath = fallback;
-  return cachedPath;
+  const fallback = flavor.command;
+  logError(
+    `resolveQoderCliPath(${key}): could not resolve ${flavor.npmPackage}/${flavor.bundlePath}, falling back to "${fallback}" on PATH` + (key === "cn" ? " \u2014 install it with `npm i -g @qodercn-ai/qoderclicn` or set QODER_CN_CLI_PATH" : "")
+  );
+  cache.set(key, fallback);
+  return fallback;
 }
 
 // src/tool-bridge.ts
@@ -1092,7 +1115,7 @@ var QoderLanguageModel = class {
     this.pat = options.apiKey || (this.region === "cn" ? process.env.QODERCN_PERSONAL_ACCESS_TOKEN : void 0) || process.env.QODER_PERSONAL_ACCESS_TOKEN || process.env.QODER_PAT || "";
     this.cwd = options.cwd;
     this.modelDef = findModel(modelId, this.region);
-    this.qoderCliPath = resolveQoderCliPath();
+    this.qoderCliPath = resolveQoderCliPath(this.region);
     logInfo(`QoderLanguageModel created: model=${modelId}, cliPath=${this.qoderCliPath}`);
   }
   /** 确保 PAT 可用（延迟检查，避免初始化时抛异常） */

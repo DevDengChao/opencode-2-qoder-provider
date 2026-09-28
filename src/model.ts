@@ -151,8 +151,9 @@ export class QoderLanguageModel implements LanguageModelV3 {
     // 查找模型定义
     this.modelDef = findModel(modelId, this.region);
 
-    // 解析 qodercli.js 路径（用于 ProcessTransport，绕过 Bun 下 WorkerTransport 的兼容性问题）
-    this.qoderCliPath = resolveQoderCliPath();
+    // 解析对应区域的 CLI 路径（用于 ProcessTransport，绕过 Bun 下 WorkerTransport 的兼容性问题）
+    // CN 账号必须用 CN 版 CLI，否则 PAT 会被 exchange 到全球 openapi 并报 access_token_invalid
+    this.qoderCliPath = resolveQoderCliPath(this.region);
     logInfo(`QoderLanguageModel created: model=${modelId}, cliPath=${this.qoderCliPath}`);
   }
 

@@ -314,12 +314,29 @@ export class StreamMapper {
 
   // ─── result 消息处理 ─────────────────────────────────────────────────────
   private mapResult(msg: any): V3StreamPart[] {
-    if (msg.subtype === "error") {
-      const errors = msg.errors || [];
-      return [{
-        type: "error",
-        error: new Error(errors.map((e: any) => e.message).join("; ") || "Unknown error"),
-      }];
+    // 失败结果必须显式报错：qodercli 的失败 subtype 不止 "error"。
+    // 实测（CN 账号配了 global 构建的 CLI）：
+    //   {type:"result", subtype:"error_during_execution", is_error:true,
+    //    errors:["The provided access token was rejected by the API"],
+    //    terminal_reason:"access_token_invalid"}
+    // 旧实现只认 subtype==="error" → 把失败当成功 → 上层收到空回复（内容为空、无报错）。
+    const subtype: unknown = msg.subtype;
+    const isError =
+      msg.is_error === true ||
+      subtype === "error" ||
+      (typeof subtype === "string" && subtype.startsWith("error"));
+
+    if (isError) {
+      const raw = Array.isArray(msg.errors) ? msg.errors : [];
+      const messages = raw
+        .map((e: any) => (typeof e === "string" ? e : e?.message))
+        .filter((s: unknown): s is string => typeof s === "string" && s.length > 0);
+      const detail =
+        messages.join("; ") ||
+        (typeof msg.terminal_reason === "string" ? msg.terminal_reason : "") ||
+        (typeof subtype === "string" ? subtype : "") ||
+        "Unknown error";
+      return [{ type: "error", error: new Error(detail) }];
     }
     // result/success — 权威 usage（final 替换流式累积值），stop_reason 一并更新，
     // 然后发出唯一的 finish（result 是工具轮次终止前最后的 usage 来源）

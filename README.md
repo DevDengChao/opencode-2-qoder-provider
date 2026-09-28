@@ -262,10 +262,42 @@ $env:QODER_PERSONAL_ACCESS_TOKEN = "pt-your-token-here"
 | `QODERCN_PERSONAL_ACCESS_TOKEN` | CN 区域 PAT（CN 区优先读取） |
 | `QODER_REGION` | 默认区域：`global`（默认）/ `cn` |
 | `QODER_DEBUG` | 设为 `1` 启用 debug 级日志（见下文"日志"） |
-| `QODER_CLI_PATH` | 显式指定 qodercli.js 路径（一般无需设置，插件自带 CLI） |
+| `QODER_CLI_PATH` | 显式指定 CLI 的 JS bundle 路径（跨区域通用覆盖，一般无需设置，插件自带 CLI） |
+| `QODER_CN_CLI_PATH` | 显式指定 **CN 版** CLI（`qoderclicn.js`）路径；优先级高于 `QODER_CLI_PATH` |
 | `QODER_PAT` | `QODER_PERSONAL_ACCESS_TOKEN` 的别名（仅模型调用侧读取，不影响模型目录注入；推荐统一使用前者） |
 
-### 4. 使用
+### 4. CN 区域特别说明（Qoder CN 账号必读）
+
+**CN 账号必须使用 CN 版 CLI。** npm 上的 `@qoder-ai/qodercli` 是 **Global 构建**
+（区域在构建期写死：bundle 内是 `"cn" == (<site 常量>)`，常量值为 `"global"`），
+它会把 access token exchange 到全球 openapi。拿 CN 账号的 PAT 去跑它，CLI 直接返回：
+
+```json
+{"type":"result","subtype":"error_during_execution","is_error":true,
+ "errors":["The provided access token was rejected by the API"],
+ "terminal_reason":"access_token_invalid"}
+```
+
+因此本包**按区域**解析 CLI：
+
+| 区域 | 解析顺序（逐个命中即停） |
+|------|--------------------------|
+| `global` | `QODER_GLOBAL_CLI_PATH` → `QODER_CLI_PATH` → `包根/node_modules/@qoder-ai/qodercli/bundle/qodercli.js` → PATH 上的 `qodercli` |
+| `cn` | `QODER_CN_CLI_PATH` → `QODER_CLI_PATH` → `包根/node_modules/@qodercn-ai/qoderclicn/bundle/qoderclicn.js` → PATH 上的 `qoderclicn`（**不会**回退到全局 `qodercli`） |
+
+`@qodercn-ai/qoderclicn` 已声明为 **optionalDependency**：正常 `npm install` 之后
+CN 区域开箱即用。若被跳过（如 `--omit=optional`），任选其一补齐：
+
+```bash
+npm i -g @qodercn-ai/qoderclicn                                        # npm 兼容方式
+curl -fsSL https://static.qoder.com.cn/qoder-cli-cn/install.sh | bash  # 官方安装脚本（原生二进制）
+export QODER_CN_CLI_PATH=/path/to/qoderclicn.js                        # 或显式指定 bundle 路径
+```
+
+> PAT 与区域绑定：CN 账号用 `QODERCN_PERSONAL_ACCESS_TOKEN`，Global 账号用
+> `QODER_PERSONAL_ACCESS_TOKEN`；CN 区域未设专属变量时会回退读取后者。
+
+### 5. 使用
 
 ```bash
 opencode
@@ -299,8 +331,8 @@ provider 本体 `dist/index.js` 两个大版本通用，无需改动。
 | provider 声明 | `provider.<id>.npm` | `providers.<id>.package`，值需带 `aisdk:` 前缀 |
 | provider 参数 | `options` | `settings` |
 | 插件声明 | `plugin`（字符串数组） | `plugins`（字符串/对象数组） |
-| 插件入口 | `dist/plugin.js`（config hook） | `plugin-v2/` 目录（`ctx.catalog.transform`） |
-| 模型注入方式 | 写 `config.provider[].models` | `draft.model.update(providerID, modelID, fn)` |
+| 插件入口 | `dist/plugin.js`（config hook） | `plugin-v2/` 目录（`ctx.model.transform`） |
+| 模型注入方式 | 写 `config.provider[].models` | `draft.update(providerID, modelID, fn)`（未声明的 id 即 upsert） |
 
 ```jsonc
 {
@@ -319,6 +351,24 @@ provider 本体 `dist/index.js` 两个大版本通用，无需改动。
 ```
 
 可直接复制的最小示例见 [opencode-v2.json.example](./opencode-v2.json.example)。
+
+**V2 插件实现要点（opencode 2.0.18 实测）**：
+
+- 2.0.18 的插件 ctx 里**没有 `ctx.catalog`**，模型目录走 `ctx.model.transform`（同名字段还有
+  `list` / `default` / `reload`）；`ctx.catalog.transform` 是文档/开发分支上的旧形态。
+  本包两种形态都探测（`ctx.model ?? ctx.catalog`），不存在的命名空间静默跳过，
+  这样在本地 CLI 上下文（ctx 只有 `app`/`location`）下也不会报错。
+- **transform 回调必须同步**：回调里一旦 `await`，Immer draft 会被 finalize 并冻结，
+  之后所有写入都抛 `This object has been frozen and should not be mutated`
+  （实测：在回调里抓目录 → 14 个模型 0 个注入成功）。因此目录抓取一律放在**注册
+  transform 之前**完成，回调体内只做同步 upsert。
+- provider 的 `region` 只有在 draft 里才看得到，所以 `cn` / `global` 两个区域都会预取；
+  没有对应区域 PAT 时 `loadCatalog` 直接读缓存，不发网络请求。
+- `draft.update(providerID, modelID, fn)` 对未声明的 id 是 **upsert**；若该 provider
+  此时还没出现在 draft 里，调用会静默失效（不会报错）→ 目录注入后建议用
+  `opencode models | grep -c '^qoder-cn/'` 复核。
+- CLI 的失败结果（`is_error: true`，如 CN 账号误用 Global CLI 的
+  `error_during_execution`）会被映射为 error part，不会被当成成功的空回复。
 
 - **PAT**：环境变量名与 V1 相同（CN 用 `QODERCN_PERSONAL_ACCESS_TOKEN`），也可写在
   `providers.<id>.settings.apiKey`（明文入库需谨慎）。注意 provider 代码运行在
@@ -384,6 +434,8 @@ MiniMax / Cantus 等）迭代频繁，不进入静态表，由动态目录提供
 | Git 直装后 `/models` 无 Qoder 且日志无 `injected`（配置确认无误） | opencode 自动安装 git 依赖可能在"包本体落盘"环节静默挂起（网络不佳时，依赖树已落盘但本体缺失，全程无报错——安装错误仅发往会话事件流，不写日志）。按[方式二](#方式二git-直装--手动预热)的预热命令把包手动装进包缓存后重启：Windows `npm install "github:wcmk21/opencode-qoder-provider" --prefix "$env:USERPROFILE\.cache\opencode\packages\github_wcmk21\opencode-qoder-provider"`，Linux/macOS 目录名保留冒号（见[包缓存位置](#包缓存位置)）；或改用[方式一](#方式一本地构建--file-引用推荐)的本地路径 |
 | 模型列表比预期少 | 模型目录来自 HTTP API（1 小时缓存）。看日志是否有 403 / 网络错误；删除模型缓存 `~/.opencode/qoder-models.json`（CN 为 `qoder-cn-models.json`）后重启强制刷新 |
 | 调用报 `Set QODER_PERSONAL_ACCESS_TOKEN` | PAT 未传到模型调用层：确认环境变量名拼写（CN 区需 `QODERCN_PERSONAL_ACCESS_TOKEN`），或改用 `options.apiKey`；Windows 下 `$env:` 设置仅在当前会话生效 |
+| 回复为空 / 没有内容且无报错 | CN 账号误用 Global CLI 的典型表现（token 被全球 openapi 拒绝）。本包 v0.2.0 起会把 CLI 的失败结果（`is_error: true` 或 `subtype` 以 `error` 开头）作为 error part 抛出，不再静默 finish；若仍是空回复，先看 `/models` 里 `qoder-cn/*` 是否只有 1 个（说明目录注入没生效，见下一行），再确认 CLI 是 CN 版（README「CN 区域特别说明」） |
+| CN 区域报 `access_token_invalid` | 用了 Global 构建的 CLI：安装 `@qodercn-ai/qoderclicn`（或装官方脚本版 `qodercn`），必要时用 `QODER_CN_CLI_PATH` 指定；日志中 `QoderLanguageModel created: … cliPath=…` 会打印实际使用的 CLI 路径 |
 | 修改配置 / 重新构建后不生效 | 清理 opencode 包缓存 `~/.cache/opencode/packages/` 与模型目录缓存 `~/.opencode/qoder-*.json`，重启 opencode（opencode 启动时缓存旧插件与目录） |
 | 响应异常 / 请求失败 | 设置 `QODER_DEBUG=1` 重启复现，提取日志中 ERROR / DEBUG 段提 issue（注意脱敏，DEBUG 含 prompt 片段） |
 
@@ -398,10 +450,10 @@ src/
 ├── tool-bridge.ts  # 声明型 MCP 工具桥接（opencode 工具 → qodercli 可见不可执行）
 ├── models.ts       # 模型目录管理（HTTP API + 静态 fallback + 缓存）
 ├── catalog-loader.ts # 目录加载共享逻辑（PAT 解析/超时/包名识别，两个插件入口共用）
-├── cli-path.ts     # qodercli.js 路径解析（Windows file:// URL 兼容）
+├── cli-path.ts     # 按区域解析 CLI（global: qodercli.js / cn: qoderclicn.js；Windows file:// URL 兼容）
 ├── logger.ts       # 文件日志（避免污染 TUI）
 ├── plugin.ts       # opencode V1 Plugin 入口（config hook 注入模型目录 / 事件处理）
-├── plugin-v2.ts    # opencode V2 Plugin 入口源码（catalog.transform 注入模型目录）
+├── plugin-v2.ts    # opencode V2 Plugin 入口源码（ctx.model.transform 注入模型目录）
 └── ../plugin-v2/   # V2 插件包目录（package.json + index.js 构建产物；V2 要求 plugins 指向目录）
 ```
 
