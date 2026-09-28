@@ -9,7 +9,9 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 
 const LOG_DIR = join(homedir(), ".local", "state", "opencode");
-const LOG_FILE = join(LOG_DIR, "qoder-provider.log");
+// 允许覆盖日志路径：单元测试用 QODER_LOG_FILE 指到临时文件，
+// 避免测试输出污染真实的 ~/.local/state/opencode/qoder-provider.log（曾导致验证时误读）
+const LOG_FILE = process.env.QODER_LOG_FILE || join(LOG_DIR, "qoder-provider.log");
 
 // 确保日志目录存在
 try {

@@ -25,6 +25,7 @@
   ],
   "files": [
     "dist",
+    "plugin-v2",
     "README.md"
   ],
   "main": "dist/index.js",
@@ -39,7 +40,7 @@
       "types": "./dist/plugin.d.ts"
     },
     "./plugin-v2": {
-      "import": "./dist/plugin-v2.js",
+      "import": "./plugin-v2/index.js",
       "types": "./dist/plugin-v2.d.ts"
     },
     "./server": {
@@ -52,7 +53,7 @@
   },
   "scripts": {
     "build": "npm run build:js && npm run build:types",
-    "build:js": "esbuild src/index.ts src/plugin.ts src/plugin-v2.ts --bundle --platform=node --format=esm --outdir=dist --external:@qoder-ai/qoder-agent-sdk --external:@ai-sdk/provider --external:@opencode-ai/plugin --external:zod",
+    "build:js": "esbuild src/index.ts src/plugin.ts --bundle --platform=node --format=esm --outdir=dist --external:@qoder-ai/qoder-agent-sdk --external:@ai-sdk/provider --external:@opencode-ai/plugin --external:zod && esbuild src/plugin-v2.ts --bundle --platform=node --format=esm --outfile=plugin-v2/index.js --external:@qoder-ai/qoder-agent-sdk --external:@ai-sdk/provider --external:@opencode-ai/plugin --external:zod",
     "build:types": "tsc --emitDeclarationOnly",
     "check": "tsc --noEmit",
     "test": "vitest run",

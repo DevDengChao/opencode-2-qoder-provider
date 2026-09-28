@@ -6,6 +6,7 @@ import { describe, it, expect, vi } from "vitest";
 // 识别 provider，而本 fork 的目录名/文件路径是 `opencode-2-qoder-provider`，匹配不上，
 // 会导致"配置里声明了 provider 但模型列表永远是空的"。T5 修复后必须转绿。
 const mock = vi.hoisted(() => {
+  process.env.QODER_LOG_FILE = "/tmp/qoder-provider-tests.log"; // 不污染真实日志
   const CATALOG = [
     { id: "auto", name: "Auto · Qoder CN", reasoning: true, input: ["text"] as const, contextWindow: 180_000, maxTokens: 32_768, sdkModelId: "auto" },
     { id: "qwen3.7-max", name: "Qwen 3.7 Max · Qoder CN", reasoning: true, input: ["text"] as const, contextWindow: 1_000_000, maxTokens: 32_768, sdkModelId: "qmodel_latest" },

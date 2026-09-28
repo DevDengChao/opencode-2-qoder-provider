@@ -1,7 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 // V2 插件（src/plugin-v2.ts）单元测试：用假 ctx 捕获 catalog.transform 的 draft 调用。
-const mock = vi.hoisted(() => ({
+const mock = vi.hoisted(() => {
+  process.env.QODER_LOG_FILE = "/tmp/qoder-provider-tests.log"; // 不污染真实日志
+  return {
   CATALOG: [
     { id: "auto", name: "Auto · Qoder CN", reasoning: true, input: ["text"], contextWindow: 180_000, maxTokens: 32_768, sdkModelId: "auto" },
     { id: "qwen3.7-max", name: "Qwen 3.7 Max · Qoder CN", reasoning: true, input: ["text"], contextWindow: 1_000_000, maxTokens: 32_768, sdkModelId: "qmodel_latest" },
@@ -9,7 +11,8 @@ const mock = vi.hoisted(() => ({
   CACHED: [
     { id: "auto", name: "Auto · Qoder CN", reasoning: true, input: ["text"], contextWindow: 180_000, maxTokens: 32_768, sdkModelId: "auto" },
   ],
-}));
+  };
+});
 
 vi.mock("../src/models.js", () => ({
   fetchModelCatalog: vi.fn(async () => [...mock.CATALOG]),

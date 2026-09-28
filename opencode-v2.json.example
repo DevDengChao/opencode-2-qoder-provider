@@ -27,14 +27,17 @@
     // }
   },
 
-  // ── plugins：宿主钩子（dist/plugin-v2.js，导出 { id, setup }） ──
-  // 字符串形式（自动识别 provider）：
-  "plugins": ["/abs/path/to/opencode-2-qoder-provider/dist/plugin-v2.js"]
+  // ── plugins：宿主钩子（V2 入口在 plugin-v2/ 目录，导出 { id, setup }） ──
+  // 注意：V2 的 plugins 路径必须是**目录包**（目录内有 package.json）。
+  // 写成文件路径（…/dist/plugin-v2.js）会被拒：
+  //   WARN message="configured plugin path must be a directory"
+  // 字符串形式（自动按 api.package 识别 provider）：
+  "plugins": ["opencode-qoder-provider-v2@file:/abs/path/to/opencode-2-qoder-provider/plugin-v2"]
 
   // 对象形式（可显式指定目标 provider 与区域；插件加载早于 provider 注册时用这个）：
   // "plugins": [
   //   {
-  //     "package": "/abs/path/to/opencode-2-qoder-provider/dist/plugin-v2.js",
+  //     "package": "opencode-qoder-provider-v2@file:/abs/path/to/opencode-2-qoder-provider/plugin-v2",
   //     "options": { "providerID": "qoder-cn", "region": "cn" }
   //   }
   // ]

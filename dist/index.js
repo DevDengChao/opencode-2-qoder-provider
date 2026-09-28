@@ -10,7 +10,7 @@ import { appendFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 var LOG_DIR = join(homedir(), ".local", "state", "opencode");
-var LOG_FILE = join(LOG_DIR, "qoder-provider.log");
+var LOG_FILE = process.env.QODER_LOG_FILE || join(LOG_DIR, "qoder-provider.log");
 try {
   if (!existsSync(LOG_DIR)) mkdirSync(LOG_DIR, { recursive: true });
 } catch {

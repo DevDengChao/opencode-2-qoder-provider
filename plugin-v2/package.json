@@ -1,0 +1,11 @@
+{
+  "name": "opencode-qoder-provider-v2",
+  "version": "0.2.0",
+  "private": true,
+  "description": "OpenCode V2 plugin entry for opencode-qoder-provider (catalog.transform model injection). V2 要求 plugins 路径指向一个目录包，因此这里用独立 package.json + index.js。",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  }
+}

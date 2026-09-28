@@ -284,17 +284,22 @@ opencode
 
 ## OpenCode V2（2.x）接入
 
-opencode 2.x 更换了 provider 与插件契约，本包为此提供**第三个入口 `dist/plugin-v2.js`**
-（旧的 `dist/plugin.js` 在 V2 会被加载器直接拒载：
-`Plugin must export a default definition with an id and an effect or setup function`）。
+opencode 2.x 更换了 provider 与插件契约，本包为此提供**V2 插件包 `plugin-v2/`**
+（入口 `plugin-v2/index.js`）。旧的 `dist/plugin.js` 在 V2 会被加载器直接拒载：
+`Plugin must export a default definition with an id and an effect or setup function`。
 provider 本体 `dist/index.js` 两个大版本通用，无需改动。
+
+> **V2 的 `plugins` 路径必须指向"目录包"**（该目录内要有 `package.json`）。写成
+> `…/dist/plugin-v2.js` 这类**文件**路径会被拒：
+> `WARN message="configured plugin path must be a directory"` —— 这是接入 V2 时最
+> 容易踩的坑，因此本包把 V2 入口做成独立目录 `plugin-v2/`（自带 package.json）。
 
 | 项 | V1（1.x） | V2（2.x） |
 |----|-----------|-----------|
 | provider 声明 | `provider.<id>.npm` | `providers.<id>.package`，值需带 `aisdk:` 前缀 |
 | provider 参数 | `options` | `settings` |
 | 插件声明 | `plugin`（字符串数组） | `plugins`（字符串/对象数组） |
-| 插件入口 | `dist/plugin.js`（config hook） | `dist/plugin-v2.js`（`ctx.catalog.transform`） |
+| 插件入口 | `dist/plugin.js`（config hook） | `plugin-v2/` 目录（`ctx.catalog.transform`） |
 | 模型注入方式 | 写 `config.provider[].models` | `draft.model.update(providerID, modelID, fn)` |
 
 ```jsonc
@@ -302,13 +307,14 @@ provider 本体 `dist/index.js` 两个大版本通用，无需改动。
   "providers": {
     "qoder-cn": {
       "name": "Qoder CN",
-      "package": "aisdk:file:///abs/path/to/opencode-qoder-provider/dist/index.js",
+      "package": "aisdk:file:///abs/path/to/opencode-2-qoder-provider/dist/index.js",
       "settings": { "region": "cn" },
       // 只需一个锚点模型；其余模型由插件在启动时注入，无需手写
       "models": { "auto": { "name": "Auto · Qoder CN" } }
     }
   },
-  "plugins": ["/abs/path/to/opencode-qoder-provider/dist/plugin-v2.js"]
+  // 目录包规格：<名称>@file:<plugin-v2 目录的绝对路径>
+  "plugins": ["opencode-qoder-provider-v2@file:/abs/path/to/opencode-2-qoder-provider/plugin-v2"]
 }
 ```
 
@@ -319,19 +325,19 @@ provider 本体 `dist/index.js` 两个大版本通用，无需改动。
   **opencode 服务端进程**内：以 systemd 部署时用 `EnvironmentFile=` / `Environment=`
   把 PAT 注入服务环境，写在 shell profile 里对已启动的服务无效，须重启服务。
 - **插件选项**（对象形式，可选）：
-  `{"package": "…/dist/plugin-v2.js", "options": {"providerID": "qoder-cn", "region": "cn"}}`。
+  `{"package": "…/plugin-v2", "options": {"providerID": "qoder-cn", "region": "cn"}}`。
   `providerID` 显式指定目标 provider，用于"插件加载早于 provider 注册"的顺序场景；
   不填时按 provider 的 `api.package` 自动识别（含 `qoder` 即命中）。
-- **锚点与覆盖**：config 中声明的模型 ID 若与目录同名，插件写入的元数据会以
-  config 声明为准的那一份为准（V1 是 config 覆盖插件；V2 由 catalog 合并，建议
-  锚点只保留 `name` 之类的显示字段）。
-- **校验**：`opencode models | grep '^qoder-cn/'` 应列出目录中的全部模型；
+- **锚点与覆盖**：config 中声明的模型 ID 若与目录同名，以 config 声明为准（V1 是
+  config 覆盖插件；V2 由 catalog 合并，建议锚点只保留 `name` 之类的显示字段）。
+- **校验**：`opencode models | grep -c '^qoder-cn/'` 应远大于 1（V2 目录当前 14 个）；
   日志 `~/.local/state/opencode/qoder-provider.log` 出现
   `[qoder-v2] injected N models into provider "qoder-cn" (region=cn)`。
 - **排障**：
-  - `/models` 里没有 Qoder → 确认 `plugins` 指向 **`dist/plugin-v2.js`**（不是
-    `dist/plugin.js`），并用 `opencode debug config` 确认该条目已被读到。
-  - 只有一个锚点模型 → 插件未生效或未取到目录：确认服务进程环境里有 PAT
+  - 日志出现 `configured plugin path must be a directory` → `plugins` 写成了文件
+    路径，改成 `…/plugin-v2` 目录规格（见上）。
+  - `/models` 里没有 Qoder → 用 `opencode debug config` 确认 `plugins` 条目已被读到。
+  - 只有一个锚点模型 → 插件未加载或未取到目录：确认服务进程环境里有 PAT
     （`tr '\0' '\n' < /proc/<server-pid>/environ | grep QODERCN_`）、
     缓存文件 `~/.opencode/qoder-cn-models.json` 是否生成。
   - 改动插件或 provider 配置后需要重启 opencode 服务（配置热重载不会重新加载
@@ -395,7 +401,8 @@ src/
 ├── cli-path.ts     # qodercli.js 路径解析（Windows file:// URL 兼容）
 ├── logger.ts       # 文件日志（避免污染 TUI）
 ├── plugin.ts       # opencode V1 Plugin 入口（config hook 注入模型目录 / 事件处理）
-└── plugin-v2.ts    # opencode V2 Plugin 入口（catalog.transform 注入模型目录）
+├── plugin-v2.ts    # opencode V2 Plugin 入口源码（catalog.transform 注入模型目录）
+└── ../plugin-v2/   # V2 插件包目录（package.json + index.js 构建产物；V2 要求 plugins 指向目录）
 ```
 
 ## 已知限制
