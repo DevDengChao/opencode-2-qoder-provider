@@ -1,0 +1,76 @@
+/**
+ * catalog-loader.ts — V1（plugin.ts）与 V2（plugin-v2.ts）两个插件入口共用的
+ * 模型目录加载逻辑，避免两份实现漂移。
+ *
+ * - resolvePat     PAT 解析：options.apiKey → 区域专属 env → 全局 env
+ * - loadCatalog    带超时的目录抓取；无 PAT 或失败时回退本地缓存/静态表
+ * - isQoderPackage 用包规格字符串识别"是不是本包声明的 provider"
+ *   （V1 用 config.provider[].npm，V2 用 catalog provider 的 api.package；
+ *    两者都可能是 npm 名 / github: 规格 / file:// 绝对路径，因此不能硬编码仓库名）
+ */
+import {
+  fetchModelCatalog,
+  getCachedModels,
+  resolveRegion,
+  type QoderModelDef,
+  type QoderRegion,
+} from "./models.js";
+import { logError } from "./logger.js";
+
+export type LoaderOptions = Record<string, any> | undefined;
+
+/** 超时包装：给远端抓取兜底，避免拖慢宿主启动 */
+export function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (err) => { clearTimeout(timer); reject(err); },
+    );
+  });
+}
+
+/** PAT 解析：options.apiKey → 区域专属 env → 全局 env */
+export function resolvePat(options: LoaderOptions, region: QoderRegion): string {
+  return (
+    options?.apiKey ||
+    (region === "cn" ? process.env.QODERCN_PERSONAL_ACCESS_TOKEN : undefined) ||
+    process.env.QODER_PERSONAL_ACCESS_TOKEN ||
+    ""
+  );
+}
+
+/**
+ * 获取当前区域的模型目录。
+ * fetchModelCatalog 在缓存新鲜（<1h）时不发起网络请求；缓存过期时走远端，
+ * 整体限时 8s（避免拖慢宿主启动），失败/超时回退到本地缓存或静态列表。
+ */
+export async function loadCatalog(
+  options: LoaderOptions,
+  region: QoderRegion,
+  timeoutMs = 8_000,
+): Promise<QoderModelDef[]> {
+  const pat = resolvePat(options, region);
+  if (!pat) return getCachedModels(region);
+  try {
+    return await withTimeout(fetchModelCatalog(pat, region), timeoutMs, "model catalog fetch");
+  } catch (err) {
+    logError("[qoder] model catalog fetch failed, falling back to local cache:",
+      (err as Error)?.message || err);
+    return getCachedModels(region);
+  }
+}
+
+/**
+ * 包规格识别：兼容
+ *  - `opencode-qoder-provider`（上游包名）
+ *  - `opencode-2-qoder-provider`（本 fork 的仓库目录名）
+ *  - `github:<owner>/<repo>` 与 `file:///abs/path/...` 规格
+ * 旧实现硬编码 `includes("opencode-qoder-provider")`，导致 fork 路径（`opencode-2-…`）
+ * 匹配失败 → provider 已声明但模型列表恒为空。
+ */
+export function isQoderPackage(spec: unknown): boolean {
+  return typeof spec === "string" && spec.includes("qoder");
+}
+
+export { resolveRegion };

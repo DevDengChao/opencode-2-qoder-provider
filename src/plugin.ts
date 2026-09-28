@@ -1,5 +1,5 @@
 /**
- * plugin.ts — OpenCode Plugin 入口
+ * plugin.ts — OpenCode V1 Plugin 入口
  *
  * opencode 的模型列表只来自 config（opencode.json 中 provider.models 的显式声明）。
  * provider factory 返回的 models 对象不会被 opencode 读取（opencode 加载 provider
@@ -22,58 +22,16 @@
  *   },
  *   "plugin": ["github:wcmk21/opencode-qoder-provider"]
  * }
+ *
+ * V2（opencode 2.x）请改用 src/plugin-v2.ts（本文件导出的是 V1 契约的裸函数，
+ * V2 加载器会拒绝）。共享逻辑见 catalog-loader.ts。
  */
 import type { Plugin, Config } from "@opencode-ai/plugin";
-import {
-  fetchModelCatalog,
-  getCachedModels,
-  resolveRegion,
-  type QoderModelDef,
-  type QoderRegion,
-} from "./models.js";
-import { logInfo, logError } from "./logger.js";
+import { fetchModelCatalog, type QoderModelDef } from "./models.js";
+import { isQoderPackage, loadCatalog, resolvePat, resolveRegion } from "./catalog-loader.js";
+import { logInfo } from "./logger.js";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
-    promise.then(
-      (value) => { clearTimeout(timer); resolve(value); },
-      (err) => { clearTimeout(timer); reject(err); },
-    );
-  });
-}
-
-/** PAT 解析：options.apiKey → 区域专属 env → 全局 env */
-function resolvePat(options: Record<string, any> | undefined, region: QoderRegion): string {
-  return (
-    options?.apiKey ||
-    (region === "cn" ? process.env.QODERCN_PERSONAL_ACCESS_TOKEN : undefined) ||
-    process.env.QODER_PERSONAL_ACCESS_TOKEN ||
-    ""
-  );
-}
-
-/**
- * 获取当前区域的模型目录。
- * fetchModelCatalog 在缓存新鲜（<1h）时不发起网络请求；缓存过期时走远端，
- * 整体限时 8s（避免拖慢 opencode 启动），失败/超时回退到本地缓存或静态列表。
- */
-async function loadCatalog(
-  options: Record<string, any> | undefined,
-  region: QoderRegion,
-): Promise<QoderModelDef[]> {
-  const pat = resolvePat(options, region);
-  if (!pat) return getCachedModels(region);
-  try {
-    return await withTimeout(fetchModelCatalog(pat, region), 8_000, "model catalog fetch");
-  } catch (err) {
-    logError("[qoder-plugin] model catalog fetch failed, falling back to local cache:",
-      (err as Error)?.message || err);
-    return getCachedModels(region);
-  }
-}
-
 /** QoderModelDef → opencode config 中的模型声明（models.dev 风格字段） */
 function toModelSpec(m: QoderModelDef) {
   return {
@@ -90,11 +48,6 @@ function toModelSpec(m: QoderModelDef) {
     limit: { context: m.contextWindow, output: m.maxTokens },
     cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
   };
-}
-
-/** 通过 npm 字段识别本包声明的 provider（npm / file:// 均命中） */
-function isQoderProvider(npm: unknown): boolean {
-  return typeof npm === "string" && npm.includes("opencode-qoder-provider");
 }
 
 // ─── Plugin ─────────────────────────────────────────────────────────────────
@@ -117,7 +70,7 @@ export const QoderPlugin: Plugin = async (ctx) => {
       if (!providers) return;
 
       for (const [providerID, p] of Object.entries(providers)) {
-        if (!p || !isQoderProvider(p.npm)) continue;
+        if (!p || !isQoderPackage(p.npm)) continue;
 
         const region = resolveRegion(p.options?.region);
         const models = await loadCatalog(p.options, region);
