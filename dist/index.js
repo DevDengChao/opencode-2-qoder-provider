@@ -47,6 +47,110 @@ function logInfo(...args) {
   write("INFO", args);
 }
 
+// src/toolcall-leak.ts
+var LEAK_MARKER = "<tool_call>";
+var LEAK_MARKER_END = "</tool_call>";
+var FUNCTION_RE = /<function[=:\s]+([A-Za-z0-9_.\-]+)[^>]*>/;
+var PARAM_RE = /<parameter[=:\s]+([A-Za-z0-9_.\-]+)[^>]*>([\s\S]*?)<\/parameter>/g;
+var STRAY_TAG_RE = /<\/?(?:parameter|function|tool_call)[^>]*>/g;
+function stripStructureNewlines(value) {
+  return value.replace(/^\r?\n/, "").replace(/\r?\n$/, "");
+}
+function stripToolsPrefix(name) {
+  return name.replace(/^tools\./i, "");
+}
+function collectXmlParams(region) {
+  const out = {};
+  let matched = false;
+  PARAM_RE.lastIndex = 0;
+  let m;
+  while ((m = PARAM_RE.exec(region)) !== null) {
+    out[m[1]] = stripStructureNewlines(m[2]);
+    matched = true;
+  }
+  return matched ? out : void 0;
+}
+function tryJsonObject(text) {
+  const cleaned = text.replace(STRAY_TAG_RE, "").trim();
+  if (!cleaned) return void 0;
+  try {
+    const value = JSON.parse(cleaned);
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      return value;
+    }
+  } catch {
+  }
+  return void 0;
+}
+function normalizeExecuteCode(code) {
+  return code.replace(/\btools\.execute_shell\s*\(/g, "tools.shell(").replace(/\btools\.bash\s*\(/g, "tools.shell(").replace(/\btools\.exec\s*\(/g, "tools.shell(");
+}
+function buildCall(rawName, region) {
+  const name = rawName.trim();
+  const base = stripToolsPrefix(name).toLowerCase();
+  const params = collectXmlParams(region);
+  if (params && Object.keys(params).length > 0) {
+    if (base === "execute" && !("code" in params) && typeof params.command === "string") {
+      const input = { command: params.command };
+      if (typeof params.workdir === "string") input.workdir = params.workdir;
+      return { rawName: "shell", input };
+    }
+    if (base === "execute" && typeof params.code === "string") {
+      return { rawName: name, input: { ...params, code: normalizeExecuteCode(params.code) } };
+    }
+    return { rawName: name, input: params };
+  }
+  const regionText = region.replace(STRAY_TAG_RE, "").trim();
+  if (!regionText) return void 0;
+  const asJson = tryJsonObject(region);
+  if (asJson) return { rawName: name, input: asJson };
+  if (base === "execute") return { rawName: name, input: { code: regionText } };
+  return void 0;
+}
+function parseLeakedToolCalls(text) {
+  const items = [];
+  let callCount = 0;
+  let pos = 0;
+  const pushText = (s) => {
+    if (s) items.push({ kind: "text", text: s });
+  };
+  while (pos < text.length) {
+    const start = text.indexOf(LEAK_MARKER, pos);
+    if (start < 0) {
+      pushText(text.slice(pos));
+      break;
+    }
+    let end = text.indexOf(LEAK_MARKER_END, start + LEAK_MARKER.length);
+    if (end < 0) {
+      if (text.indexOf("</function>", start) >= 0) {
+        end = text.length;
+      } else {
+        pushText(text.slice(start));
+        break;
+      }
+    }
+    const blockEnd = Math.min(end + LEAK_MARKER_END.length, text.length);
+    const inner = text.slice(start + LEAK_MARKER.length, end);
+    let call;
+    const fn = FUNCTION_RE.exec(inner);
+    if (fn) {
+      let region = inner.slice(fn.index + fn[0].length);
+      const fnEnd = region.indexOf("</function>");
+      if (fnEnd >= 0) region = region.slice(0, fnEnd);
+      call = buildCall(fn[1], region);
+    }
+    if (call) {
+      pushText(text.slice(pos, start));
+      items.push({ kind: "call", call });
+      callCount++;
+    } else {
+      pushText(text.slice(pos, blockEnd));
+    }
+    pos = blockEnd;
+  }
+  return { items, callCount };
+}
+
 // src/mapper.ts
 var StreamMapper = class {
   /** index → block 状态（per-query） */
@@ -58,6 +162,12 @@ var StreamMapper = class {
   toOpencodeName;
   /** 模型上下文窗口（用于 context_usage_ratio 估算输入 token） */
   contextWindow;
+  /** opencode 工具名清单（文本泄漏回收时的名称归一化参考） */
+  knownToolNames;
+  /** 本消息是否从文本中回收过工具调用（finish 判定为 tool-calls） */
+  synthesizedToolCalls = false;
+  /** 泄漏回收 tool-call id 的序号（保证同一消息内 id 唯一） */
+  leakSeq = 0;
   // usage 累积状态：流式事件增量合并（max），result 权威替换（final）
   usageInput;
   usageOutput;
@@ -70,9 +180,10 @@ var StreamMapper = class {
   /** 服务端请求级真实计量（Qoder credits；0/缺失视为未报告） */
   credits;
   pendingStopReason;
-  constructor(toOpencodeName, contextWindow) {
+  constructor(toOpencodeName, contextWindow, knownToolNames) {
     this.toOpencodeName = toOpencodeName;
     this.contextWindow = contextWindow ?? 0;
+    this.knownToolNames = knownToolNames && knownToolNames.length > 0 ? knownToolNames : void 0;
   }
   /** 工具名映射：未知名转换为安全的占位名，由 opencode 返回 tool not found */
   mapToolName(providerName) {
@@ -93,6 +204,7 @@ var StreamMapper = class {
     this.outputChars = 0;
     this.credits = void 0;
     this.pendingStopReason = void 0;
+    this.synthesizedToolCalls = false;
   }
   /**
    * 处理一个 SDKMessage，返回零或多个 LanguageModelV3StreamPart。
@@ -148,7 +260,10 @@ var StreamMapper = class {
           switch (block.type) {
             case "text":
               state.id = `t${idx}`;
-              parts.push({ type: "text-start", id: state.id });
+              state.textStarted = false;
+              state.holdback = "";
+              state.inLeak = false;
+              state.leakBuffer = "";
               break;
             case "thinking":
               state.id = `r${idx}`;
@@ -179,7 +294,7 @@ var StreamMapper = class {
               if (state) {
                 const text = delta.text || "";
                 this.outputChars += text.length;
-                parts.push({ type: "text-delta", id: state.id, delta: text });
+                parts.push(...this.pushTextDelta(state, text));
               }
               break;
             case "thinking_delta":
@@ -217,7 +332,7 @@ var StreamMapper = class {
         if (state) {
           switch (state.type) {
             case "text":
-              parts.push({ type: "text-end", id: state.id });
+              parts.push(...this.finalizeTextBlock(state));
               break;
             case "thinking":
               parts.push({ type: "reasoning-end", id: state.id });
@@ -239,7 +354,7 @@ var StreamMapper = class {
       }
       case "message_delta": {
         this.applyUsage(event.usage, false);
-        if (event.delta?.stop_reason) this.pendingStopReason = event.delta.stop_reason;
+        if (event.delta?.stop_reason && !this.synthesizedToolCalls) this.pendingStopReason = event.delta.stop_reason;
         break;
       }
       case "message_stop":
@@ -265,7 +380,7 @@ var StreamMapper = class {
       const total = msg.total_credits;
       if (typeof total === "number" && Number.isFinite(total) && total > 0) this.credits = total;
     }
-    if (msg.stop_reason) this.pendingStopReason = msg.stop_reason;
+    if (msg.stop_reason && !this.synthesizedToolCalls) this.pendingStopReason = msg.stop_reason;
     return this.flushFinish();
   }
   // ─── stop_reason 映射 ───────────────────────────────────────────────────
@@ -341,9 +456,12 @@ var StreamMapper = class {
    * 发出唯一的 finish（幂等）。
    * model.ts 在循环结束 / 工具边界终止进程前调用，确保 finish 携带
    * 此刻累积到的最完整 usage（result 权威值或流式增量）。
+   * 发出前先收尾未关闭的文本块（flushPending）：模型进程提前终止时，
+   * 暂扣/泄漏缓冲中的内容不丢失，回收出的工具调用也能计入 finishReason。
    */
   flushFinish() {
     if (this.emittedFinish) return [];
+    const pending = this.flushPending();
     this.emittedFinish = true;
     const part = {
       type: "finish",
@@ -353,11 +471,148 @@ var StreamMapper = class {
     if (this.credits !== void 0) {
       part.providerMetadata = { copilot: { totalNanoAiu: this.credits * 1e11 } };
     }
-    return [part];
+    return [...pending, part];
   }
   /** 是否已到达工具边界（暂存的 stop_reason=tool_use），供 model.ts 决定终止时机 */
   isToolBoundary() {
     return this.pendingStopReason === "tool_use";
+  }
+  // ─── 文本泄漏回收（tool_call XML，解析器见 toolcall-leak.ts） ─────────────
+  /**
+   * text 块 holdback 流式处理：
+   *  - 常规文本即时发出（懒发 text-start）
+   *  - 命中 `<tool_call>`：标记之前的文本照发，之后的 delta 收入 leakBuffer，
+   *    等块结束（或流终止的兜底收尾）时解析成真正的 tool-call
+   *  - 疑似标记前缀（≤10 字符）暂扣，避免把半截 `<tool_ca` 发进文本
+   */
+  pushTextDelta(state, text) {
+    if (!text) return [];
+    if (state.inLeak) {
+      state.leakBuffer = (state.leakBuffer || "") + text;
+      return [];
+    }
+    const parts = [];
+    const pending = (state.holdback || "") + text;
+    const markerIdx = pending.indexOf(LEAK_MARKER);
+    if (markerIdx >= 0) {
+      parts.push(...this.emitText(state, pending.slice(0, markerIdx)));
+      state.inLeak = true;
+      state.leakBuffer = pending.slice(markerIdx + LEAK_MARKER.length);
+      state.holdback = "";
+      return parts;
+    }
+    let keep = 0;
+    const maxKeep = Math.min(pending.length, LEAK_MARKER.length - 1);
+    for (let p = maxKeep; p >= 1; p--) {
+      if (pending.endsWith(LEAK_MARKER.slice(0, p))) {
+        keep = p;
+        break;
+      }
+    }
+    if (keep > 0) {
+      parts.push(...this.emitText(state, pending.slice(0, pending.length - keep)));
+      state.holdback = pending.slice(pending.length - keep);
+    } else {
+      parts.push(...this.emitText(state, pending));
+      state.holdback = "";
+    }
+    return parts;
+  }
+  /** 发出文本（懒发 text-start，保证纯泄漏块不产生空文本段） */
+  emitText(state, text) {
+    if (!text) return [];
+    const parts = [];
+    if (!state.textStarted) {
+      state.textStarted = true;
+      parts.push({ type: "text-start", id: state.id });
+    }
+    parts.push({ type: "text-delta", id: state.id, delta: text });
+    return parts;
+  }
+  /**
+   * text 块结束：处于泄漏捕获态则尝试解析。
+   *  - 解析成功：残余文本 + 真正的 tool-call（并置 tool_use 边界，finish=tool-calls）
+   *  - 解析失败：原始文本原样吐出（绝不丢内容）
+   */
+  finalizeTextBlock(state) {
+    const parts = [];
+    if (!state.inLeak) {
+      if (state.holdback) {
+        parts.push(...this.emitText(state, state.holdback));
+        state.holdback = "";
+      }
+      if (state.textStarted) parts.push({ type: "text-end", id: state.id });
+      return parts;
+    }
+    const raw = LEAK_MARKER + (state.leakBuffer || "");
+    const parsed = parseLeakedToolCalls(raw);
+    if (parsed.callCount === 0) {
+      parts.push(...this.emitText(state, raw));
+      if (state.textStarted) parts.push({ type: "text-end", id: state.id });
+      logInfo("mapper: <tool_call> text detected but not parseable; kept as text");
+      return parts;
+    }
+    for (const item of parsed.items) {
+      if (item.kind === "text") {
+        if (item.text.trim()) parts.push(...this.emitText(state, item.text));
+      } else {
+        parts.push(...this.emitToolCallParts(state, item.call));
+      }
+    }
+    if (state.textStarted) parts.push({ type: "text-end", id: state.id });
+    this.synthesizedToolCalls = true;
+    this.pendingStopReason = "tool_use";
+    const names = parsed.items.flatMap((i) => i.kind === "call" ? [i.call.rawName] : []);
+    logInfo(`mapper: recovered ${parsed.callCount} leaked tool call(s) from text: ${names.join(", ")}`);
+    return parts;
+  }
+  /** 泄漏工具调用 → tool-input-start/delta/end + tool-call 事件（名称做归一化） */
+  emitToolCallParts(state, call) {
+    const toolName = this.resolveLeakedName(call.rawName);
+    const input = JSON.stringify(call.input);
+    const id = `${state.id}_leak${++this.leakSeq}`;
+    return [
+      { type: "tool-input-start", id, toolName, providerExecuted: false },
+      { type: "tool-input-delta", id, delta: input },
+      { type: "tool-input-end", id },
+      { type: "tool-call", toolCallId: id, toolName, input, providerExecuted: false }
+    ];
+  }
+  /**
+   * 泄漏名 → opencode 工具名：
+   * 映射表命中 → `tools.` 前缀剥离后映射 → 与 opencode 工具名做大小写不敏感匹配
+   * → 兜底占位名（opencode 返回 tool not found，模型可自行纠正）
+   */
+  resolveLeakedName(raw) {
+    const clean = raw.trim();
+    const candidates = [clean];
+    const stripped = clean.replace(/^tools\./i, "");
+    if (stripped !== clean) candidates.push(stripped);
+    for (const c of candidates) {
+      const mapped = this.toOpencodeName?.(c);
+      if (mapped) return mapped;
+    }
+    if (this.knownToolNames) {
+      for (const c of candidates) {
+        const lower = c.toLowerCase();
+        const hit = this.knownToolNames.find((n) => n.toLowerCase() === lower);
+        if (hit) return hit;
+      }
+    }
+    return this.mapToolName(stripped || clean);
+  }
+  /**
+   * 收尾未关闭的文本块（模型进程提前终止 / 流结束而不发 content_block_stop 时），
+   * 防止暂扣文本与泄漏缓冲丢失，并让泄漏回收在 flushFinish 路径同样生效。
+   */
+  flushPending() {
+    if (this.blocks.size === 0) return [];
+    const parts = [];
+    for (const [, state] of this.blocks) {
+      if (state.type === "text") parts.push(...this.finalizeTextBlock(state));
+    }
+    this.blocks.clear();
+    return parts;
   }
 };
 
@@ -890,6 +1145,7 @@ function buildQoderToolBridge(tools) {
   return {
     server,
     toolCount: declarations.length,
+    toolNames: [...names],
     canUseTool,
     toOpencodeName: (providerName) => providerToOc.get(providerName),
     toProviderName: (opencodeName) => ocToProvider.get(opencodeName)
@@ -1042,6 +1298,7 @@ function withTransportNotice(systemPrompt, hasTools) {
   const toolNotice = hasTools ? [
     "OpenCode-native tools are declared to you, but OpenCode is the sole tool executor.",
     "When a tool is needed, emit the matching tool call and wait for its tool_result in the next request.",
+    "Tool calls must be emitted through the native tool-call channel only; never write a tool call as plain text or XML tags (e.g. <tool_call>/<function> blocks) \u2014 text-form calls are not executed.",
     "Qoder native tools are disabled; never claim a tool succeeded before OpenCode returns its result."
   ] : [
     "This request exposes no tools.",
@@ -1169,7 +1426,11 @@ var QoderLanguageModel = class {
         abortController: abort.controller
       }
     });
-    const mapper = new StreamMapper((providerName) => bridge?.toOpencodeName(providerName), this.modelDef?.contextWindow);
+    const mapper = new StreamMapper(
+      (providerName) => bridge?.toOpencodeName(providerName),
+      this.modelDef?.contextWindow,
+      bridge?.toolNames
+    );
     return { q, mapper, built, bridge, abort };
   }
   // ── doGenerate (非流式) ──────────────────────────────────────────────────
@@ -1325,6 +1586,7 @@ var QoderLanguageModel = class {
 };
 
 // src/index.ts
+logInfo("qoder-provider: dist module loaded");
 function maskPat(pat) {
   if (!pat) return "(empty)";
   if (pat.length <= 8) return "***";

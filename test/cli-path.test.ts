@@ -3,6 +3,12 @@ import { mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+// 解析过程会写日志：指向临时文件，避免污染真实的 qoder-provider.log
+// （vi.hoisted 在 import 求值前执行；同 plugin-v2.test.ts 做法）
+vi.hoisted(() => {
+  process.env.QODER_LOG_FILE = "/tmp/qoder-provider-tests.log";
+});
+
 /**
  * cli-path 解析测试。
  *

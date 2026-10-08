@@ -6,8 +6,16 @@
  *   message_start, content_block_start, content_block_delta,
  *   content_block_stop, message_delta, message_stop
  *
+ * 另含「工具调用文本泄漏回收」：qfmodel 偶发把 tool_use 以
+ * `<tool_call><function=…>…</function></tool_call>` 纯文本形式输出
+ * （stop_reason=end_turn），opencode 会当作普通文本、整轮无声中断。
+ * text 块流式阶段做 holdback 拦截，块结束时解析回真正的 tool-call
+ * 事件（解析器见 toolcall-leak.ts）。
+ *
  * 每个 Query 对应一个 StreamMapper 实例（per-query state）。
  */
+import { parseLeakedToolCalls, LEAK_MARKER, type LeakedToolCall } from "./toolcall-leak.js";
+import { logInfo } from "./logger.js";
 
 // ─── AI SDK V3 流式事件类型 ────────────────────────────────────────────────
 /** JSON 兼容值（结构与 AI SDK 内部 JSONValue 一致，保证可赋给 SharedV3ProviderMetadata） */
@@ -48,6 +56,11 @@ interface BlockState {
   id: string;       // tool_use: call ID; text/thinking: 生成的 ID
   name?: string;    // tool_use: tool name
   accumulatedArgs: string; // tool_use: accumulated JSON args
+  // ── text 块专用（工具调用文本泄漏回收，见 toolcall-leak.ts）──
+  textStarted?: boolean;   // 懒发 text-start：首个实际文本 delta 时才发（纯泄漏块不产生空文本段）
+  holdback?: string;       // 疑似 `<tool_call>` 前缀的暂扣缓冲（≤10 字符）
+  inLeak?: boolean;        // 已命中 `<tool_call>`，后续 delta 全部收入 leakBuffer
+  leakBuffer?: string;     // `<tool_call>` 之后的原始文本（块结束/收尾时解析）
 }
 
 /** BetaUsage（qodercli 流式事件的 usage 结构，Anthropic 风格） */
@@ -80,6 +93,12 @@ export class StreamMapper {
   private toOpencodeName?: (providerName: string) => string | undefined;
   /** 模型上下文窗口（用于 context_usage_ratio 估算输入 token） */
   private contextWindow: number;
+  /** opencode 工具名清单（文本泄漏回收时的名称归一化参考） */
+  private knownToolNames?: string[];
+  /** 本消息是否从文本中回收过工具调用（finish 判定为 tool-calls） */
+  private synthesizedToolCalls = false;
+  /** 泄漏回收 tool-call id 的序号（保证同一消息内 id 唯一） */
+  private leakSeq = 0;
 
   // usage 累积状态：流式事件增量合并（max），result 权威替换（final）
   private usageInput?: number;
@@ -94,9 +113,14 @@ export class StreamMapper {
   private credits?: number;
   private pendingStopReason?: string | null;
 
-  constructor(toOpencodeName?: (providerName: string) => string | undefined, contextWindow?: number) {
+  constructor(
+    toOpencodeName?: (providerName: string) => string | undefined,
+    contextWindow?: number,
+    knownToolNames?: string[],
+  ) {
     this.toOpencodeName = toOpencodeName;
     this.contextWindow = contextWindow ?? 0;
+    this.knownToolNames = knownToolNames && knownToolNames.length > 0 ? knownToolNames : undefined;
   }
 
   /** 工具名映射：未知名转换为安全的占位名，由 opencode 返回 tool not found */
@@ -119,6 +143,7 @@ export class StreamMapper {
     this.outputChars = 0;
     this.credits = undefined;
     this.pendingStopReason = undefined;
+    this.synthesizedToolCalls = false;
   }
 
   /**
@@ -189,8 +214,12 @@ export class StreamMapper {
 
           switch (block.type) {
             case "text":
+              // 懒发 text-start：等首个实际文本 delta 再发（纯泄漏块不产生空文本段）
               state.id = `t${idx}`;
-              parts.push({ type: "text-start", id: state.id });
+              state.textStarted = false;
+              state.holdback = "";
+              state.inLeak = false;
+              state.leakBuffer = "";
               break;
 
             case "thinking":
@@ -226,7 +255,7 @@ export class StreamMapper {
               if (state) {
                 const text = delta.text || "";
                 this.outputChars += text.length;
-                parts.push({ type: "text-delta", id: state.id, delta: text });
+                parts.push(...this.pushTextDelta(state, text));
               }
               break;
 
@@ -269,7 +298,7 @@ export class StreamMapper {
         if (state) {
           switch (state.type) {
             case "text":
-              parts.push({ type: "text-end", id: state.id });
+              parts.push(...this.finalizeTextBlock(state));
               break;
             case "thinking":
               parts.push({ type: "reasoning-end", id: state.id });
@@ -296,7 +325,8 @@ export class StreamMapper {
         // flushFinish() 发出——立即发 finish 会用不完整的 usage 封顶，
         // 且工具轮次终止进程后 result（权威 usage）再也无法补入
         this.applyUsage(event.usage, false);
-        if (event.delta?.stop_reason) this.pendingStopReason = event.delta.stop_reason;
+        // 发生文本泄漏回收时保持 tool_use 边界，不让 end_turn 覆盖
+        if (event.delta?.stop_reason && !this.synthesizedToolCalls) this.pendingStopReason = event.delta.stop_reason;
         break;
       }
 
@@ -348,7 +378,8 @@ export class StreamMapper {
       const total = msg.total_credits;
       if (typeof total === "number" && Number.isFinite(total) && total > 0) this.credits = total;
     }
-    if (msg.stop_reason) this.pendingStopReason = msg.stop_reason;
+    // 泄漏回收的 tool_use 边界不被 result.stop_reason（end_turn）覆盖
+    if (msg.stop_reason && !this.synthesizedToolCalls) this.pendingStopReason = msg.stop_reason;
     return this.flushFinish();
   }
 
@@ -440,9 +471,12 @@ export class StreamMapper {
    * 发出唯一的 finish（幂等）。
    * model.ts 在循环结束 / 工具边界终止进程前调用，确保 finish 携带
    * 此刻累积到的最完整 usage（result 权威值或流式增量）。
+   * 发出前先收尾未关闭的文本块（flushPending）：模型进程提前终止时，
+   * 暂扣/泄漏缓冲中的内容不丢失，回收出的工具调用也能计入 finishReason。
    */
   flushFinish(): V3StreamPart[] {
     if (this.emittedFinish) return [];
+    const pending = this.flushPending();
     this.emittedFinish = true;
     const part: Extract<V3StreamPart, { type: "finish" }> = {
       type: "finish",
@@ -455,11 +489,157 @@ export class StreamMapper {
     if (this.credits !== undefined) {
       part.providerMetadata = { copilot: { totalNanoAiu: this.credits * 1e11 } };
     }
-    return [part];
+    return [...pending, part];
   }
 
   /** 是否已到达工具边界（暂存的 stop_reason=tool_use），供 model.ts 决定终止时机 */
   isToolBoundary(): boolean {
     return this.pendingStopReason === "tool_use";
+  }
+
+  // ─── 文本泄漏回收（tool_call XML，解析器见 toolcall-leak.ts） ─────────────
+  /**
+   * text 块 holdback 流式处理：
+   *  - 常规文本即时发出（懒发 text-start）
+   *  - 命中 `<tool_call>`：标记之前的文本照发，之后的 delta 收入 leakBuffer，
+   *    等块结束（或流终止的兜底收尾）时解析成真正的 tool-call
+   *  - 疑似标记前缀（≤10 字符）暂扣，避免把半截 `<tool_ca` 发进文本
+   */
+  private pushTextDelta(state: BlockState, text: string): V3StreamPart[] {
+    if (!text) return [];
+    if (state.inLeak) {
+      state.leakBuffer = (state.leakBuffer || "") + text;
+      return [];
+    }
+    const parts: V3StreamPart[] = [];
+    const pending = (state.holdback || "") + text;
+    const markerIdx = pending.indexOf(LEAK_MARKER);
+    if (markerIdx >= 0) {
+      parts.push(...this.emitText(state, pending.slice(0, markerIdx)));
+      state.inLeak = true;
+      state.leakBuffer = pending.slice(markerIdx + LEAK_MARKER.length);
+      state.holdback = "";
+      return parts;
+    }
+    // 暂扣疑似标记前缀（`<`、`<t`、…、`<tool_call`）
+    let keep = 0;
+    const maxKeep = Math.min(pending.length, LEAK_MARKER.length - 1);
+    for (let p = maxKeep; p >= 1; p--) {
+      if (pending.endsWith(LEAK_MARKER.slice(0, p))) {
+        keep = p;
+        break;
+      }
+    }
+    if (keep > 0) {
+      parts.push(...this.emitText(state, pending.slice(0, pending.length - keep)));
+      state.holdback = pending.slice(pending.length - keep);
+    } else {
+      parts.push(...this.emitText(state, pending));
+      state.holdback = "";
+    }
+    return parts;
+  }
+
+  /** 发出文本（懒发 text-start，保证纯泄漏块不产生空文本段） */
+  private emitText(state: BlockState, text: string): V3StreamPart[] {
+    if (!text) return [];
+    const parts: V3StreamPart[] = [];
+    if (!state.textStarted) {
+      state.textStarted = true;
+      parts.push({ type: "text-start", id: state.id });
+    }
+    parts.push({ type: "text-delta", id: state.id, delta: text });
+    return parts;
+  }
+
+  /**
+   * text 块结束：处于泄漏捕获态则尝试解析。
+   *  - 解析成功：残余文本 + 真正的 tool-call（并置 tool_use 边界，finish=tool-calls）
+   *  - 解析失败：原始文本原样吐出（绝不丢内容）
+   */
+  private finalizeTextBlock(state: BlockState): V3StreamPart[] {
+    const parts: V3StreamPart[] = [];
+    if (!state.inLeak) {
+      if (state.holdback) {
+        parts.push(...this.emitText(state, state.holdback));
+        state.holdback = "";
+      }
+      if (state.textStarted) parts.push({ type: "text-end", id: state.id });
+      return parts;
+    }
+
+    const raw = LEAK_MARKER + (state.leakBuffer || "");
+    const parsed = parseLeakedToolCalls(raw);
+    if (parsed.callCount === 0) {
+      parts.push(...this.emitText(state, raw));
+      if (state.textStarted) parts.push({ type: "text-end", id: state.id });
+      logInfo("mapper: <tool_call> text detected but not parseable; kept as text");
+      return parts;
+    }
+
+    for (const item of parsed.items) {
+      if (item.kind === "text") {
+        if (item.text.trim()) parts.push(...this.emitText(state, item.text));
+      } else {
+        parts.push(...this.emitToolCallParts(state, item.call));
+      }
+    }
+    if (state.textStarted) parts.push({ type: "text-end", id: state.id });
+    this.synthesizedToolCalls = true;
+    this.pendingStopReason = "tool_use";
+    const names = parsed.items.flatMap((i) => (i.kind === "call" ? [i.call.rawName] : []));
+    logInfo(`mapper: recovered ${parsed.callCount} leaked tool call(s) from text: ${names.join(", ")}`);
+    return parts;
+  }
+
+  /** 泄漏工具调用 → tool-input-start/delta/end + tool-call 事件（名称做归一化） */
+  private emitToolCallParts(state: BlockState, call: LeakedToolCall): V3StreamPart[] {
+    const toolName = this.resolveLeakedName(call.rawName);
+    const input = JSON.stringify(call.input);
+    const id = `${state.id}_leak${++this.leakSeq}`;
+    return [
+      { type: "tool-input-start", id, toolName, providerExecuted: false },
+      { type: "tool-input-delta", id, delta: input },
+      { type: "tool-input-end", id },
+      { type: "tool-call", toolCallId: id, toolName, input, providerExecuted: false },
+    ];
+  }
+
+  /**
+   * 泄漏名 → opencode 工具名：
+   * 映射表命中 → `tools.` 前缀剥离后映射 → 与 opencode 工具名做大小写不敏感匹配
+   * → 兜底占位名（opencode 返回 tool not found，模型可自行纠正）
+   */
+  private resolveLeakedName(raw: string): string {
+    const clean = raw.trim();
+    const candidates = [clean];
+    const stripped = clean.replace(/^tools\./i, "");
+    if (stripped !== clean) candidates.push(stripped);
+    for (const c of candidates) {
+      const mapped = this.toOpencodeName?.(c);
+      if (mapped) return mapped;
+    }
+    if (this.knownToolNames) {
+      for (const c of candidates) {
+        const lower = c.toLowerCase();
+        const hit = this.knownToolNames.find((n) => n.toLowerCase() === lower);
+        if (hit) return hit;
+      }
+    }
+    return this.mapToolName(stripped || clean);
+  }
+
+  /**
+   * 收尾未关闭的文本块（模型进程提前终止 / 流结束而不发 content_block_stop 时），
+   * 防止暂扣文本与泄漏缓冲丢失，并让泄漏回收在 flushFinish 路径同样生效。
+   */
+  private flushPending(): V3StreamPart[] {
+    if (this.blocks.size === 0) return [];
+    const parts: V3StreamPart[] = [];
+    for (const [, state] of this.blocks) {
+      if (state.type === "text") parts.push(...this.finalizeTextBlock(state));
+    }
+    this.blocks.clear();
+    return parts;
   }
 }

@@ -30,6 +30,10 @@ import {
 
 import { log, logError, logInfo, DEBUG } from "./logger.js";
 
+// 模块加载标记：进程 import 本包时打印一行（部署验证用——
+// 重启/重载 opencode 服务后 grep 本行，即可确认新的 dist 已被加载）
+logInfo("qoder-provider: dist module loaded");
+
 function maskPat(pat: string): string {
   if (!pat) return "(empty)";
   if (pat.length <= 8) return "***";

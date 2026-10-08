@@ -233,6 +233,7 @@ export function withTransportNotice(systemPrompt: string, hasTools: boolean): st
     ? [
         "OpenCode-native tools are declared to you, but OpenCode is the sole tool executor.",
         "When a tool is needed, emit the matching tool call and wait for its tool_result in the next request.",
+        "Tool calls must be emitted through the native tool-call channel only; never write a tool call as plain text or XML tags (e.g. <tool_call>/<function> blocks) — text-form calls are not executed.",
         "Qoder native tools are disabled; never claim a tool succeeded before OpenCode returns its result.",
       ]
     : [

@@ -224,8 +224,13 @@ export class QoderLanguageModel implements LanguageModelV3 {
     });
 
     // 4. mapper：qodercli 侧工具名 → opencode 原名；传入 contextWindow 供
-    //    usage 的 context_usage_ratio 估算输入 token
-    const mapper = new StreamMapper((providerName) => bridge?.toOpencodeName(providerName), this.modelDef?.contextWindow);
+    //    usage 的 context_usage_ratio 估算输入 token；knownToolNames 供
+    //    `<tool_call>` 文本泄漏回收时的名称归一化（见 toolcall-leak.ts）
+    const mapper = new StreamMapper(
+      (providerName) => bridge?.toOpencodeName(providerName),
+      this.modelDef?.contextWindow,
+      bridge?.toolNames,
+    );
 
     return { q, mapper, built, bridge, abort };
   }

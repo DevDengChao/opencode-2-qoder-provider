@@ -28,6 +28,11 @@ opencode 保留完整的 agent 循环与工具执行权，qodercli 只负责推�
 - **双区支持**：Global / CN 区域与各自的模型目录
 - **动态模型目录自动注入**：插件 config hook 在启动时把模型目录（HTTP API + 静态 fallback）
   注入 opencode 配置，模型选择器**无需手动声明任何模型**
+- **工具调用文本泄漏回收**：模型偶发把工具调用写成 `<tool_call><function=…>` XML 文本
+  而非原生 tool_use 流事件（`stop_reason=end_turn`，整轮会被当作普通文本结束、任务无声中断）。
+  mapper 在流内拦截该文本并转为真正的 tool-call（工具名归一化：`tools.` 前缀剥离、
+  大小写不敏感匹配、`tools.bash/exec/execute_shell` → `tools.shell`）；截断/畸形内容
+  原样保留为文本，绝不执行半截命令
 
 ## 架构
 
@@ -527,6 +532,8 @@ src/
    本包强制使用 ProcessTransport 运行 CLI 自带的 JS 版 bundle；且**按区域**选择
    二进制（Global：`@qoder-ai/qodercli`，CN：`@qodercn-ai/qoderclicn`），因为区域是
    CLI 的构建期常量，跨区域调用会被拒绝（见「CN 区域特别说明」）
+5. **工具调用文本回收是尽力而为**：仅当泄漏 XML 块结构完整（函数名可识别、参数标签闭合）
+   时转换为真实调用；截断/畸形块原样保留为文本（不执行），由模型在下一轮自行恢复
 
 ## 开发
 

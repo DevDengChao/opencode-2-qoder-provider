@@ -40,6 +40,8 @@ const VALID_NAME = /^[A-Za-z0-9_-]{1,64}$/;
 export interface QoderToolBridge {
   server: McpSdkServerConfigWithInstance;
   toolCount: number;
+  /** opencode 侧原始工具名清单（mapper 回收 `<tool_call>` 文本泄漏时的名称归一化） */
+  toolNames: string[];
   canUseTool: CanUseTool;
   /** qodercli 侧工具名（exposedName/内部名/mcp__ 全名）→ opencode 原名 */
   toOpencodeName(providerName: string): string | undefined;
@@ -152,6 +154,7 @@ export function buildQoderToolBridge(
   return {
     server,
     toolCount: declarations.length,
+    toolNames: [...names],
     canUseTool,
     toOpencodeName: (providerName) => providerToOc.get(providerName),
     toProviderName: (opencodeName) => ocToProvider.get(opencodeName),

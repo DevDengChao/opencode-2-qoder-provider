@@ -1,4 +1,10 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+
+// context 对畸形 tool-call input 的记录会写日志：指向临时文件，避免污染真实日志
+vi.hoisted(() => {
+  process.env.QODER_LOG_FILE = "/tmp/qoder-provider-tests.log";
+});
+
 import { buildQoderPrompt, withTransportNotice } from "../src/context.js";
 
 const userMsg = (text: string): any => ({ role: "user", content: [{ type: "text", text }] });

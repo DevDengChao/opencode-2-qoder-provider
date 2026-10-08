@@ -58,11 +58,12 @@ describe("StreamMapper 事件映射", () => {
     expect(m.map(messageStart())).toEqual([{ type: "stream-start", warnings: [] }]);
   });
 
-  it("完整 text 块：text-start → text-delta → text-end", () => {
+  it("完整 text 块：首个 delta 懒发 text-start → text-delta → text-end", () => {
     const m = new StreamMapper();
     m.map(messageStart());
-    expect(m.map(blockStart(0, { type: "text" }))).toEqual([{ type: "text-start", id: "t0" }]);
+    expect(m.map(blockStart(0, { type: "text" }))).toEqual([]);
     expect(m.map(blockDelta(0, { type: "text_delta", text: "hello" }))).toEqual([
+      { type: "text-start", id: "t0" },
       { type: "text-delta", id: "t0", delta: "hello" },
     ]);
     expect(m.map(blockStop(0))).toEqual([{ type: "text-end", id: "t0" }]);
