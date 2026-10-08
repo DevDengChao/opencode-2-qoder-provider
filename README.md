@@ -541,7 +541,7 @@ src/
 npm install        # 安装依赖
 npm run check      # TypeScript 类型检查
 npm run build      # 构建 dist/（provider：esbuild bundle + tsc 声明）与 plugin-v2/index.js（V2 插件目录包）
-npm test           # 运行单元测试（vitest，无需网络/PAT；当前 108 例）
+npm test           # 运行单元测试（vitest，无需网络/PAT；当前 133 例）
 node test-bridge.mjs  # 端到端测试（需要真实 PAT 与网络）
 ```
 
@@ -549,6 +549,23 @@ node test-bridge.mjs  # 端到端测试（需要真实 PAT 与网络）
 （`env -u QODER_REGION -u QODERCN_PERSONAL_ACCESS_TOKEN npm test`）——shell 里
 导出的变量会掩盖区域相关缺陷；测试自身通过 `QODER_LOG_FILE` 写临时日志，
 不会污染真实日志。
+
+### 部署到本机 opencode 服务
+
+provider 包被服务进程 `import` 后缓存在进程内；`opencode reload` 只重载 location
+服务、**不会**重新加载本包——改动 dist 后必须重启服务：
+
+```bash
+npm run build
+systemctl restart opencode
+grep 'dist module loaded' ~/.local/state/opencode/qoder-provider.log | tail -1   # 新构建已加载的标记
+```
+
+`src/index.ts` 里的 "dist module loaded" 日志即部署验证标记（每个 import 本包的
+进程打印一次）。注意：服务重启后，活跃会话会被自动续跑（合成 restart 通知 + 历史
+重放，内存/CPU 短暂高企）——风暴期间不要用 `opencode api get` / `opencode session
+list` 探测服务：响应变慢会触发 CLI 的 "Background service is unresponsive" 恢复
+路径，误杀正在启动的服务。
 
 ## License
 
