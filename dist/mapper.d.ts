@@ -147,21 +147,35 @@ export declare class StreamMapper {
     /** 是否已到达工具边界（暂存的 stop_reason=tool_use），供 model.ts 决定终止时机 */
     isToolBoundary(): boolean;
     /**
-     * text 块 holdback 流式处理：
-     *  - 常规文本即时发出（懒发 text-start）
-     *  - 命中 `<tool_call>`：标记之前的文本照发，之后的 delta 收入 leakBuffer，
-     *    等块结束（或流终止的兜底收尾）时解析成真正的 tool-call
-     *  - 疑似标记前缀（≤10 字符）暂扣，避免把半截 `<tool_ca` 发进文本
+     * text 块流式处理：
+     *  - 块首探测（仅限块内尚无任何输出时）：约 30 字符内判定是否疑似"内容块
+     *    JSON"开头（classifyContentBlockJsonStart）；疑似则整块缓冲（cbBuffered），
+     *    块结束时解析回收；排除则按普通文本流程继续
+     *  - 普通流程（pushTextNormal）：命中 `<tool_call>` 后 delta 收入 leakBuffer，
+     *    等块结束（或流终止的兜底收尾）时解析成真正的 tool-call；
+     *    疑似标记前缀（≤10 字符）暂扣，避免把半截 `<tool_ca` 发进文本
      */
     private pushTextDelta;
+    /**
+     * 普通文本流程：XML `<tool_call>` 标记检测 + ≤10 字符前缀暂扣。
+     *  - 命中标记：标记之前的文本照发，之后的 delta 收入 leakBuffer
+     *  - 疑似标记前缀（`<`、`<t`、…、`<tool_call`）暂扣
+     */
+    private pushTextNormal;
     /** 发出文本（懒发 text-start，保证纯泄漏块不产生空文本段） */
     private emitText;
     /**
-     * text 块结束：处于泄漏捕获态则尝试解析。
-     *  - 解析成功：残余文本 + 真正的 tool-call（并置 tool_use 边界，finish=tool-calls）
+     * text 块结束：处于泄漏捕获 / 内容块候选态则尝试解析。
+     *  - 解析成功：文本 + 真正的 tool-call（并置 tool_use 边界，finish=tool-calls）
      *  - 解析失败：原始文本原样吐出（绝不丢内容）
      */
     private finalizeTextBlock;
+    /**
+     * 泄漏解析结果 → 流式部件：text 项按原顺序回流；call 项发
+     * tool-input-start/delta/end + tool-call（名称做归一化）。
+     * 置 tool_use 边界（finish=tool-calls，不让 end_turn 覆盖）并记日志。
+     */
+    private emitRecovered;
     /** 泄漏工具调用 → tool-input-start/delta/end + tool-call 事件（名称做归一化） */
     private emitToolCallParts;
     /**

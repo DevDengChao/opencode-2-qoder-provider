@@ -6,15 +6,20 @@
  *   message_start, content_block_start, content_block_delta,
  *   content_block_stop, message_delta, message_stop
  *
- * 另含「工具调用文本泄漏回收」：qfmodel 偶发把 tool_use 以
- * `<tool_call><function=…>…</function></tool_call>` 纯文本形式输出
- * （stop_reason=end_turn），opencode 会当作普通文本、整轮无声中断。
- * text 块流式阶段做 holdback 拦截，块结束时解析回真正的 tool-call
- * 事件（解析器见 toolcall-leak.ts）。
+ * 另含「工具调用文本泄漏回收」：qoder-cn 模型偶发把 tool_use 以纯文本形式
+ * 输出（stop_reason=end_turn），opencode 会当作普通文本、整轮无声中断。
+ * 两种形态：
+ *  - XML 形：`<tool_call><function=…>…</function></tool_call>` —— text 流式
+ *    阶段 holdback 拦截（解析器见 toolcall-leak.ts）；
+ *  - 内容块 JSON 形：整块为 `[{"type":"tool_use",…},…]`（可混 `{"type":"text",…}`
+ *    自序列化变体，与桥 replay 转录记号同构）—— 块首探测 + 整块缓冲，块结束
+ *    时解析（解析器见 content-block-leak.ts）。
+ * 回收成功的轮次置 tool_use 边界（finish=tool-calls），让会话继续而不是无声终止。
  *
  * 每个 Query 对应一个 StreamMapper 实例（per-query state）。
  */
-import { parseLeakedToolCalls, LEAK_MARKER, type LeakedToolCall } from "./toolcall-leak.js";
+import { parseLeakedToolCalls, LEAK_MARKER, type LeakedToolCall, type LeakParseResult } from "./toolcall-leak.js";
+import { classifyContentBlockJsonStart, parseLeakedContentBlocks, CONTENT_BLOCK_PROBE_MAX } from "./content-block-leak.js";
 import { logInfo } from "./logger.js";
 
 // ─── AI SDK V3 流式事件类型 ────────────────────────────────────────────────
@@ -56,11 +61,14 @@ interface BlockState {
   id: string;       // tool_use: call ID; text/thinking: 生成的 ID
   name?: string;    // tool_use: tool name
   accumulatedArgs: string; // tool_use: accumulated JSON args
-  // ── text 块专用（工具调用文本泄漏回收，见 toolcall-leak.ts）──
+  // ── text 块专用（工具调用文本泄漏回收，见 toolcall-leak.ts / content-block-leak.ts）──
   textStarted?: boolean;   // 懒发 text-start：首个实际文本 delta 时才发（纯泄漏块不产生空文本段）
   holdback?: string;       // 疑似 `<tool_call>` 前缀的暂扣缓冲（≤10 字符）
   inLeak?: boolean;        // 已命中 `<tool_call>`，后续 delta 全部收入 leakBuffer
   leakBuffer?: string;     // `<tool_call>` 之后的原始文本（块结束/收尾时解析）
+  cbProbe?: boolean;       // 块首探测中（缓冲少量前缀判定是否疑似内容块 JSON）
+  cbBuffered?: boolean;    // 已判定候选：整块缓冲至块结束再解析
+  cbBuffer?: string;       // 探测 / 候选缓冲
 }
 
 /** BetaUsage（qodercli 流式事件的 usage 结构，Anthropic 风格） */
@@ -220,6 +228,9 @@ export class StreamMapper {
               state.holdback = "";
               state.inLeak = false;
               state.leakBuffer = "";
+              state.cbProbe = false;
+              state.cbBuffered = false;
+              state.cbBuffer = "";
               break;
 
             case "thinking":
@@ -497,15 +508,51 @@ export class StreamMapper {
     return this.pendingStopReason === "tool_use";
   }
 
-  // ─── 文本泄漏回收（tool_call XML，解析器见 toolcall-leak.ts） ─────────────
+  // ─── 文本泄漏回收（XML 形 / 内容块 JSON 形，见 toolcall-leak.ts / content-block-leak.ts） ───
   /**
-   * text 块 holdback 流式处理：
-   *  - 常规文本即时发出（懒发 text-start）
-   *  - 命中 `<tool_call>`：标记之前的文本照发，之后的 delta 收入 leakBuffer，
-   *    等块结束（或流终止的兜底收尾）时解析成真正的 tool-call
-   *  - 疑似标记前缀（≤10 字符）暂扣，避免把半截 `<tool_ca` 发进文本
+   * text 块流式处理：
+   *  - 块首探测（仅限块内尚无任何输出时）：约 30 字符内判定是否疑似"内容块
+   *    JSON"开头（classifyContentBlockJsonStart）；疑似则整块缓冲（cbBuffered），
+   *    块结束时解析回收；排除则按普通文本流程继续
+   *  - 普通流程（pushTextNormal）：命中 `<tool_call>` 后 delta 收入 leakBuffer，
+   *    等块结束（或流终止的兜底收尾）时解析成真正的 tool-call；
+   *    疑似标记前缀（≤10 字符）暂扣，避免把半截 `<tool_ca` 发进文本
    */
   private pushTextDelta(state: BlockState, text: string): V3StreamPart[] {
+    if (!text) return [];
+    // 已判定为内容块 JSON 候选：整块缓冲，块结束时统一解析
+    if (state.cbBuffered) {
+      state.cbBuffer = (state.cbBuffer || "") + text;
+      return [];
+    }
+    // 块首探测（或探测已在进行）：缓冲少量前缀后判定
+    if (state.cbProbe || (!state.textStarted && !state.holdback && !state.inLeak)) {
+      state.cbProbe = true;
+      const buf = (state.cbBuffer || "") + text;
+      const verdict = classifyContentBlockJsonStart(buf);
+      if (verdict === "keep" && buf.length <= CONTENT_BLOCK_PROBE_MAX) {
+        state.cbBuffer = buf;
+        return [];
+      }
+      state.cbProbe = false;
+      state.cbBuffer = "";
+      if (verdict === "commit") {
+        state.cbBuffered = true;
+        state.cbBuffer = buf;
+        return [];
+      }
+      // keep 超界或 reject：按普通文本流程继续（内含 XML 标记检测）
+      return this.pushTextNormal(state, buf);
+    }
+    return this.pushTextNormal(state, text);
+  }
+
+  /**
+   * 普通文本流程：XML `<tool_call>` 标记检测 + ≤10 字符前缀暂扣。
+   *  - 命中标记：标记之前的文本照发，之后的 delta 收入 leakBuffer
+   *  - 疑似标记前缀（`<`、`<t`、…、`<tool_call`）暂扣
+   */
+  private pushTextNormal(state: BlockState, text: string): V3StreamPart[] {
     if (!text) return [];
     if (state.inLeak) {
       state.leakBuffer = (state.leakBuffer || "") + text;
@@ -553,12 +600,45 @@ export class StreamMapper {
   }
 
   /**
-   * text 块结束：处于泄漏捕获态则尝试解析。
-   *  - 解析成功：残余文本 + 真正的 tool-call（并置 tool_use 边界，finish=tool-calls）
+   * text 块结束：处于泄漏捕获 / 内容块候选态则尝试解析。
+   *  - 解析成功：文本 + 真正的 tool-call（并置 tool_use 边界，finish=tool-calls）
    *  - 解析失败：原始文本原样吐出（绝不丢内容）
    */
   private finalizeTextBlock(state: BlockState): V3StreamPart[] {
     const parts: V3StreamPart[] = [];
+
+    // 未决的块首探测：整段回归普通流程（可能在此进入 XML 泄漏态）
+    if (state.cbProbe) {
+      const buf = state.cbBuffer || "";
+      state.cbProbe = false;
+      state.cbBuffer = "";
+      if (buf) parts.push(...this.pushTextNormal(state, buf));
+    }
+
+    // 内容块 JSON 候选：整块解析回收
+    if (state.cbBuffered) {
+      const raw = state.cbBuffer || "";
+      state.cbBuffered = false;
+      state.cbBuffer = "";
+      const parsed = parseLeakedContentBlocks(raw);
+      if (parsed.callCount > 0) {
+        parts.push(...this.emitRecovered(state, parsed, "content-block JSON"));
+        return parts;
+      }
+      // 候选但不可安全回收：若其中含 XML 泄漏标记，仍按 XML 形尝试一次
+      if (raw.includes(LEAK_MARKER)) {
+        const xml = parseLeakedToolCalls(raw);
+        if (xml.callCount > 0) {
+          parts.push(...this.emitRecovered(state, xml, "text"));
+          return parts;
+        }
+      }
+      parts.push(...this.emitText(state, raw));
+      if (state.textStarted) parts.push({ type: "text-end", id: state.id });
+      logInfo("mapper: content-block JSON candidate detected but not recoverable; kept as text");
+      return parts;
+    }
+
     if (!state.inLeak) {
       if (state.holdback) {
         parts.push(...this.emitText(state, state.holdback));
@@ -576,7 +656,17 @@ export class StreamMapper {
       logInfo("mapper: <tool_call> text detected but not parseable; kept as text");
       return parts;
     }
+    parts.push(...this.emitRecovered(state, parsed, "text"));
+    return parts;
+  }
 
+  /**
+   * 泄漏解析结果 → 流式部件：text 项按原顺序回流；call 项发
+   * tool-input-start/delta/end + tool-call（名称做归一化）。
+   * 置 tool_use 边界（finish=tool-calls，不让 end_turn 覆盖）并记日志。
+   */
+  private emitRecovered(state: BlockState, parsed: LeakParseResult, source: "text" | "content-block JSON"): V3StreamPart[] {
+    const parts: V3StreamPart[] = [];
     for (const item of parsed.items) {
       if (item.kind === "text") {
         if (item.text.trim()) parts.push(...this.emitText(state, item.text));
@@ -588,7 +678,7 @@ export class StreamMapper {
     this.synthesizedToolCalls = true;
     this.pendingStopReason = "tool_use";
     const names = parsed.items.flatMap((i) => (i.kind === "call" ? [i.call.rawName] : []));
-    logInfo(`mapper: recovered ${parsed.callCount} leaked tool call(s) from text: ${names.join(", ")}`);
+    logInfo(`mapper: recovered ${parsed.callCount} leaked tool call(s) from ${source}: ${names.join(", ")}`);
     return parts;
   }
 

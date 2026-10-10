@@ -151,6 +151,124 @@ function parseLeakedToolCalls(text) {
   return { items, callCount };
 }
 
+// src/content-block-leak.ts
+var ARRAY_FIRST_KEYS = /* @__PURE__ */ new Set(["type", "id", "name", "input", "text", "pi_tool_name"]);
+var CONTENT_BLOCK_PROBE_MAX = 128;
+var MAX_LEADING_WS = 16;
+var MAX_KEY_LEN = 24;
+function isObject(v) {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+function readKey(s) {
+  let i = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    const ok = c >= 97 && c <= 122 || // a-z
+    c >= 65 && c <= 90 || // A-Z
+    c >= 48 && c <= 57 || // 0-9
+    c === 95;
+    if (c === 34) return { closed: true, text: s.slice(0, i) };
+    if (!ok) return null;
+    i++;
+    if (i > MAX_KEY_LEN) return null;
+  }
+  return { closed: false, text: s };
+}
+function classifyContentBlockJsonStart(buffer) {
+  const t = buffer.replace(/^\s+/, "");
+  if (t.length === 0) return buffer.length > MAX_LEADING_WS ? "reject" : "keep";
+  if (t[0] === "[") {
+    const rest = t.slice(1).replace(/^\s+/, "");
+    if (rest.length === 0) return "keep";
+    if (rest[0] !== "{") return "reject";
+    const rest2 = rest.slice(1).replace(/^\s+/, "");
+    if (rest2.length === 0) return "keep";
+    if (rest2[0] !== '"') return "reject";
+    const key = readKey(rest2.slice(1));
+    if (!key) return "reject";
+    if (!key.closed) return "keep";
+    return ARRAY_FIRST_KEYS.has(key.text) ? "commit" : "reject";
+  }
+  if (t[0] === "{") {
+    const rest = t.slice(1).replace(/^\s+/, "");
+    if (rest.length === 0) return "keep";
+    if (rest[0] !== '"') return "reject";
+    const key = readKey(rest.slice(1));
+    if (!key) return "reject";
+    if (!key.closed) return "keep";
+    if (key.text !== "type") return "reject";
+    const afterKey = rest.slice(1 + key.text.length + 1).replace(/^\s+/, "");
+    if (afterKey.length === 0) return "keep";
+    if (afterKey[0] !== ":") return "reject";
+    const v = afterKey.slice(1).replace(/^\s+/, "");
+    if (v.length === 0) return "keep";
+    if (v[0] !== '"') return "reject";
+    const target = '"tool_use"';
+    const prefix = v.slice(0, Math.min(v.length, target.length));
+    if (!target.startsWith(prefix)) return "reject";
+    return v.length >= target.length ? "commit" : "keep";
+  }
+  return "reject";
+}
+function parseLeakedContentBlocks(text) {
+  const fail = () => ({ items: [{ kind: "text", text }], callCount: 0 });
+  const t = text.trim();
+  if (!t || t[0] !== "[" && t[0] !== "{") return fail();
+  let value;
+  try {
+    value = JSON.parse(t);
+  } catch {
+    return fail();
+  }
+  let elements;
+  if (Array.isArray(value)) {
+    elements = value;
+  } else if (isObject(value)) {
+    elements = [value];
+  } else {
+    return fail();
+  }
+  const items = [];
+  let callCount = 0;
+  for (const el of elements) {
+    if (!isObject(el)) return fail();
+    if (el.type === "text") {
+      if (typeof el.text !== "string") return fail();
+      items.push({ kind: "text", text: el.text });
+      continue;
+    }
+    if (el.type === "tool_use") {
+      const name = typeof el.name === "string" && el.name.trim() ? el.name.trim() : typeof el.pi_tool_name === "string" && el.pi_tool_name.trim() ? el.pi_tool_name.trim() : "";
+      if (!name) return fail();
+      const rawInput = el.input !== void 0 ? el.input : el.arguments;
+      let input;
+      if (rawInput === void 0 || rawInput === null) {
+        input = {};
+      } else if (isObject(rawInput)) {
+        input = rawInput;
+      } else if (typeof rawInput === "string") {
+        let parsed;
+        try {
+          parsed = JSON.parse(rawInput);
+        } catch {
+          return fail();
+        }
+        if (!isObject(parsed)) return fail();
+        input = parsed;
+      } else {
+        return fail();
+      }
+      const call = { rawName: name, input };
+      items.push({ kind: "call", call });
+      callCount++;
+      continue;
+    }
+    return fail();
+  }
+  if (callCount === 0) return fail();
+  return { items, callCount };
+}
+
 // src/mapper.ts
 var StreamMapper = class {
   /** index → block 状态（per-query） */
@@ -264,6 +382,9 @@ var StreamMapper = class {
               state.holdback = "";
               state.inLeak = false;
               state.leakBuffer = "";
+              state.cbProbe = false;
+              state.cbBuffered = false;
+              state.cbBuffer = "";
               break;
             case "thinking":
               state.id = `r${idx}`;
@@ -477,15 +598,47 @@ var StreamMapper = class {
   isToolBoundary() {
     return this.pendingStopReason === "tool_use";
   }
-  // ─── 文本泄漏回收（tool_call XML，解析器见 toolcall-leak.ts） ─────────────
+  // ─── 文本泄漏回收（XML 形 / 内容块 JSON 形，见 toolcall-leak.ts / content-block-leak.ts） ───
   /**
-   * text 块 holdback 流式处理：
-   *  - 常规文本即时发出（懒发 text-start）
-   *  - 命中 `<tool_call>`：标记之前的文本照发，之后的 delta 收入 leakBuffer，
-   *    等块结束（或流终止的兜底收尾）时解析成真正的 tool-call
-   *  - 疑似标记前缀（≤10 字符）暂扣，避免把半截 `<tool_ca` 发进文本
+   * text 块流式处理：
+   *  - 块首探测（仅限块内尚无任何输出时）：约 30 字符内判定是否疑似"内容块
+   *    JSON"开头（classifyContentBlockJsonStart）；疑似则整块缓冲（cbBuffered），
+   *    块结束时解析回收；排除则按普通文本流程继续
+   *  - 普通流程（pushTextNormal）：命中 `<tool_call>` 后 delta 收入 leakBuffer，
+   *    等块结束（或流终止的兜底收尾）时解析成真正的 tool-call；
+   *    疑似标记前缀（≤10 字符）暂扣，避免把半截 `<tool_ca` 发进文本
    */
   pushTextDelta(state, text) {
+    if (!text) return [];
+    if (state.cbBuffered) {
+      state.cbBuffer = (state.cbBuffer || "") + text;
+      return [];
+    }
+    if (state.cbProbe || !state.textStarted && !state.holdback && !state.inLeak) {
+      state.cbProbe = true;
+      const buf = (state.cbBuffer || "") + text;
+      const verdict = classifyContentBlockJsonStart(buf);
+      if (verdict === "keep" && buf.length <= CONTENT_BLOCK_PROBE_MAX) {
+        state.cbBuffer = buf;
+        return [];
+      }
+      state.cbProbe = false;
+      state.cbBuffer = "";
+      if (verdict === "commit") {
+        state.cbBuffered = true;
+        state.cbBuffer = buf;
+        return [];
+      }
+      return this.pushTextNormal(state, buf);
+    }
+    return this.pushTextNormal(state, text);
+  }
+  /**
+   * 普通文本流程：XML `<tool_call>` 标记检测 + ≤10 字符前缀暂扣。
+   *  - 命中标记：标记之前的文本照发，之后的 delta 收入 leakBuffer
+   *  - 疑似标记前缀（`<`、`<t`、…、`<tool_call`）暂扣
+   */
+  pushTextNormal(state, text) {
     if (!text) return [];
     if (state.inLeak) {
       state.leakBuffer = (state.leakBuffer || "") + text;
@@ -530,12 +683,39 @@ var StreamMapper = class {
     return parts;
   }
   /**
-   * text 块结束：处于泄漏捕获态则尝试解析。
-   *  - 解析成功：残余文本 + 真正的 tool-call（并置 tool_use 边界，finish=tool-calls）
+   * text 块结束：处于泄漏捕获 / 内容块候选态则尝试解析。
+   *  - 解析成功：文本 + 真正的 tool-call（并置 tool_use 边界，finish=tool-calls）
    *  - 解析失败：原始文本原样吐出（绝不丢内容）
    */
   finalizeTextBlock(state) {
     const parts = [];
+    if (state.cbProbe) {
+      const buf = state.cbBuffer || "";
+      state.cbProbe = false;
+      state.cbBuffer = "";
+      if (buf) parts.push(...this.pushTextNormal(state, buf));
+    }
+    if (state.cbBuffered) {
+      const raw2 = state.cbBuffer || "";
+      state.cbBuffered = false;
+      state.cbBuffer = "";
+      const parsed2 = parseLeakedContentBlocks(raw2);
+      if (parsed2.callCount > 0) {
+        parts.push(...this.emitRecovered(state, parsed2, "content-block JSON"));
+        return parts;
+      }
+      if (raw2.includes(LEAK_MARKER)) {
+        const xml = parseLeakedToolCalls(raw2);
+        if (xml.callCount > 0) {
+          parts.push(...this.emitRecovered(state, xml, "text"));
+          return parts;
+        }
+      }
+      parts.push(...this.emitText(state, raw2));
+      if (state.textStarted) parts.push({ type: "text-end", id: state.id });
+      logInfo("mapper: content-block JSON candidate detected but not recoverable; kept as text");
+      return parts;
+    }
     if (!state.inLeak) {
       if (state.holdback) {
         parts.push(...this.emitText(state, state.holdback));
@@ -552,6 +732,16 @@ var StreamMapper = class {
       logInfo("mapper: <tool_call> text detected but not parseable; kept as text");
       return parts;
     }
+    parts.push(...this.emitRecovered(state, parsed, "text"));
+    return parts;
+  }
+  /**
+   * 泄漏解析结果 → 流式部件：text 项按原顺序回流；call 项发
+   * tool-input-start/delta/end + tool-call（名称做归一化）。
+   * 置 tool_use 边界（finish=tool-calls，不让 end_turn 覆盖）并记日志。
+   */
+  emitRecovered(state, parsed, source) {
+    const parts = [];
     for (const item of parsed.items) {
       if (item.kind === "text") {
         if (item.text.trim()) parts.push(...this.emitText(state, item.text));
@@ -563,7 +753,7 @@ var StreamMapper = class {
     this.synthesizedToolCalls = true;
     this.pendingStopReason = "tool_use";
     const names = parsed.items.flatMap((i) => i.kind === "call" ? [i.call.rawName] : []);
-    logInfo(`mapper: recovered ${parsed.callCount} leaked tool call(s) from text: ${names.join(", ")}`);
+    logInfo(`mapper: recovered ${parsed.callCount} leaked tool call(s) from ${source}: ${names.join(", ")}`);
     return parts;
   }
   /** 泄漏工具调用 → tool-input-start/delta/end + tool-call 事件（名称做归一化） */
